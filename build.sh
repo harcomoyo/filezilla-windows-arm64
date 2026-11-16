@@ -163,7 +163,7 @@ cp ${vcpkg_libs_dir}/bin/libargon2.dll .
 cp ${vcpkg_libs_dir}/bin/libz.dll .
 cp ${vcpkg_libs_dir}/bin/libsqlite3.dll .
 cp ${prefix}/bin/libfzssh*.dll .
-cp ${prefix}/bin/libfzshellext*.dll .
+cp ${filezilla_path}/bin/libfzshellext*.dll .
 cp ${prefix}/bin/libfilezilla*.dll .
 cp ${prefix}/bin/libgmp*.dll .
 cp ${prefix}/bin/libgnutls*.dll .

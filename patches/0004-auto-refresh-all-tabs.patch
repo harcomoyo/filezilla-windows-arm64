@@ -1,0 +1,190 @@
+diff --git a/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
+index 15ec10c..64122ee 100644
+--- a/src/interface/Mainfrm.cpp
++++ b/src/interface/Mainfrm.cpp
+@@ -71,6 +71,7 @@
+ #endif
+ 
+ #include <functional>
++#include <wx/numdlg.h>
+ #include <limits>
+ #include <map>
+ 
+@@ -375,6 +376,7 @@ CMainFrame::CMainFrame(COptions& options)
+ 	}
+ 
+ 	m_closeEventTimer.SetOwner(this);
++	m_autoRefreshTimer.SetOwner(this);
+ 
+ 	if (CFilterManager::HasActiveFilters(true)) {
+ 		if (options_.get_int(OPTION_FILTERTOGGLESTATE)) {
+@@ -527,6 +529,8 @@ CMainFrame::CMainFrame(COptions& options)
+ 	// Delay call to PostInitialize, otherwise macOS gets really confused about the right mouse button...
+ 	startupTimer_.SetOwner(this);
+ 	startupTimer_.Start(1, true);
++
++	UpdateAutoRefreshTimer();
+ }
+ 
+ CMainFrame::~CMainFrame()
+@@ -816,6 +820,19 @@ void CMainFrame::OnMenuHandler(wxCommandEvent &event)
+ 			}
+ 		}
+ 	}
++	else if (id == XRCID("ID_MENU_AUTOREFRESH_ENABLE")) {
++		bool const enable = options_.get_int(OPTION_AUTOREFRESH_ALL_TABS) == 0;
++		options_.set(OPTION_AUTOREFRESH_ALL_TABS, enable ? 1 : 0);
++		UpdateAutoRefreshTimer();
++	}
++	else if (id == XRCID("ID_MENU_AUTOREFRESH_INTERVAL")) {
++		long interval = options_.get_int(OPTION_AUTOREFRESH_INTERVAL);
++		wxNumberEntryDialog dlg(this, _("Refresh all tabs every N seconds:"), _("Interval in seconds"), _("Auto-refresh all tabs"), interval, 1, 3600);
++		if (dlg.ShowModal() == wxID_OK) {
++			options_.set(OPTION_AUTOREFRESH_INTERVAL, static_cast<int>(dlg.GetValue()));
++			UpdateAutoRefreshTimer();
++		}
++	}
+ 	else if (id == XRCID("ID_EXPORT")) {
+ 		CExportDialog dlg(this);
+ 		dlg.Run(options_, m_pQueueView);
+@@ -1474,6 +1491,36 @@ void CMainFrame::OnRefresh(wxCommandEvent &)
+ 	pState->RefreshLocal();
+ }
+ 
++void CMainFrame::UpdateAutoRefreshTimer()
++{
++	bool const enabled = options_.get_int(OPTION_AUTOREFRESH_ALL_TABS) != 0;
++	long const seconds = options_.get_int(OPTION_AUTOREFRESH_INTERVAL);
++	if (!enabled || seconds < 1) {
++		if (m_autoRefreshTimer.IsRunning()) {
++			m_autoRefreshTimer.Stop();
++		}
++		return;
++	}
++	m_autoRefreshTimer.Start(static_cast<int>(seconds * 1000));
++}
++
++void CMainFrame::RefreshAllTabs()
++{
++	CContextManager* const manager = CContextManager::Get();
++	if (!manager) {
++		return;
++	}
++	auto const* states = manager->GetAllStates();
++	if (!states) {
++		return;
++	}
++	for (auto* pState : *states) {
++		if (pState && pState->IsRemoteConnected() && pState->IsRemoteIdle(true)) {
++			pState->RefreshRemote(false);
++		}
++	}
++}
++
+ void CMainFrame::OnTimer(wxTimerEvent& event)
+ {
+ 	if (event.GetId() == m_closeEventTimer.GetId()) {
+@@ -1495,6 +1542,9 @@ void CMainFrame::OnTimer(wxTimerEvent& event)
+ 	else if (event.GetId() == startupTimer_.GetId()) {
+ 		PostInitialize();
+ 	}
++	else if (event.GetId() == m_autoRefreshTimer.GetId()) {
++		RefreshAllTabs();
++	}
+ }
+ 
+ void CMainFrame::OpenSiteManager(Site const* site)
+diff --git a/src/interface/Mainfrm.h b/src/interface/Mainfrm.h
+index 82c3fc8..06f311e 100644
+--- a/src/interface/Mainfrm.h
++++ b/src/interface/Mainfrm.h
+@@ -66,6 +66,8 @@ public:
+ 
+ 	void PostInitialize();
+ 
++	void RefreshAllTabs();
++
+ 	CContextControl* GetContextControl() { return m_pContextControl; }
+ 
+ 	bool ConnectToSite(Site & data, Bookmark const& bookmark, CState* pState = 0);
+@@ -129,6 +131,9 @@ private:
+ 
+ 	void OnOptionsChanged(watched_options const& options);
+ 
++	void UpdateAutoRefreshTimer();
++	wxTimer m_autoRefreshTimer;
++
+ 	// Event handlers
+ 	DECLARE_EVENT_TABLE()
+ 	void OnSize(wxSizeEvent& event);
+diff --git a/src/interface/Options.cpp b/src/interface/Options.cpp
+index 817565c..6a476d9 100644
+--- a/src/interface/Options.cpp
++++ b/src/interface/Options.cpp
+@@ -117,7 +117,9 @@ static unsigned int register_interface_options()
+ 		{ "Disable update footer", false, option_flags::normal },
+ 		{ "Tab data", L"", option_flags::normal | option_flags::sensitive_data, option_type::xml },
+ 		{ "Highest shown overlay id", 0, option_flags::normal },
+-		{ "Resolve local symlinks", DEFAULT_LOCAL_SYMLINK_RESOLVE, option_flags::platform }
++		{ "Resolve local symlinks", DEFAULT_LOCAL_SYMLINK_RESOLVE, option_flags::platform },
++		{ "Auto-refresh all tabs", true, option_flags::normal },
++		{ "Auto-refresh interval", 20, option_flags::numeric_clamp, 1, 3600 }
+ 	});
+ 	return value;
+ }
+diff --git a/src/interface/Options.h b/src/interface/Options.h
+index 3b4bca8..4663b0e 100644
+--- a/src/interface/Options.h
++++ b/src/interface/Options.h
+@@ -86,6 +86,8 @@ enum interfaceOptions : unsigned int
+ 	OPTION_TAB_DATA,
+ 	OPTION_SHOWN_OVERLAY,
+ 	OPTION_RESOLVE_LOCAL_SYMLINKS,
++	OPTION_AUTOREFRESH_ALL_TABS,
++	OPTION_AUTOREFRESH_INTERVAL,
+ 
+ 	// Has to be last element
+ 	OPTIONS_NUM
+diff --git a/src/interface/menu_bar.cpp b/src/interface/menu_bar.cpp
+index 22e974b..97f9e10 100644
+--- a/src/interface/menu_bar.cpp
++++ b/src/interface/menu_bar.cpp
+@@ -128,6 +128,12 @@ CMenuBar::CMenuBar(CMainFrame& mainFrame, COptions& options)
+ 	server->Append(XRCID("ID_MENU_SERVER_SEARCH"), _("&Search remote files..."), _("Search server for files"))->SetAccel(&accel);
+ 	server->Append(XRCID("ID_MENU_SERVER_CMD"), _("Enter &custom command..."), _("Send custom command to the server otherwise not available"));
+ 	server->Append(XRCID("ID_MENU_SERVER_VIEWHIDDEN"), _("Force showing &hidden files"), L"", wxITEM_CHECK);
++	server->AppendSeparator();
++
++	wxMenu* autorefresh = new wxMenu;
++	server->AppendSubMenu(autorefresh, _("Auto-&refresh all tabs"));
++	autorefresh->Append(XRCID("ID_MENU_AUTOREFRESH_ENABLE"), _("&Enabled"), L"", wxITEM_CHECK);
++	autorefresh->Append(XRCID("ID_MENU_AUTOREFRESH_INTERVAL"), _("Set &interval..."));
+ 
+ 	wxMenu* bookmarks = new wxMenu;
+ 	Append(bookmarks, _("&Bookmarks"));
+@@ -166,6 +172,7 @@ CMenuBar::CMenuBar(CMainFrame& mainFrame, COptions& options)
+ 	UpdateBookmarkMenu();
+ 
+ 	Check(XRCID("ID_MENU_SERVER_VIEWHIDDEN"), options_.get_int(OPTION_VIEW_HIDDEN_FILES) ? true : false);
++	Check(XRCID("ID_MENU_AUTOREFRESH_ENABLE"), options_.get_int(OPTION_AUTOREFRESH_ALL_TABS) != 0);
+ 
+ 	int mode = options_.get_int(OPTION_COMPARISONMODE);
+ 	if (mode != 1) {
+@@ -231,6 +238,7 @@ CMenuBar::CMenuBar(CMainFrame& mainFrame, COptions& options)
+ 	options_.watch(OPTION_SPEEDLIMIT_ENABLE, this);
+ 	options_.watch(OPTION_SPEEDLIMIT_INBOUND, this);
+ 	options_.watch(OPTION_SPEEDLIMIT_OUTBOUND, this);
++	options_.watch(OPTION_AUTOREFRESH_ALL_TABS, this);
+ 
+ #ifdef FZ_MAC
+ 	wxMenu* editMenu = nullptr;
+@@ -527,6 +535,9 @@ void CMenuBar::OnOptionsChanged(watched_options const& options)
+ 	if (options.test(OPTION_COMPARE_HIDEIDENTICAL)) {
+ 		Check(XRCID("ID_COMPARE_HIDEIDENTICAL"), options_.get_int(OPTION_COMPARE_HIDEIDENTICAL) != 0);
+ 	}
++	if (options.test(OPTION_AUTOREFRESH_ALL_TABS)) {
++		Check(XRCID("ID_MENU_AUTOREFRESH_ENABLE"), options_.get_int(OPTION_AUTOREFRESH_ALL_TABS) != 0);
++	}
+ 	if (options.test(OPTION_COMPARISONMODE)) {
+ 		if (options_.get_int(OPTION_COMPARISONMODE) != 1) {
+ 			Check(XRCID("ID_COMPARE_SIZE"), true);

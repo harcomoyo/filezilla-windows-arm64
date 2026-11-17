@@ -43,6 +43,11 @@ Session IDs are valid only for the current FileZilla process. A refresh response
 means that a listing was requested, not that the server has already returned it.
 Fetch the cached listing again after completion. No connect, upload, download,
 delete, rename, arbitrary FTP command, or SSH execution method is provided.
+The listing reports `cached: true`, `stale: true` (no freshness guarantee), and
+`available: false` when no cached listing exists. Pagination uses `offset >= 0`
+and `limit` from 1 through 1000. Queue summary exposes `active` and `file_count`,
+not per-file progress. API refresh rejects synchronized browsing as well as busy
+or disconnected sessions, avoiding a synchronous modal dialog from that path.
 
 Build and test the bridge with the .NET 8 SDK:
 
@@ -62,8 +67,8 @@ Examples from the published bridge directory:
 ```powershell
 .\filezilla-bridge.exe info
 .\filezilla-bridge.exe sessions list
-.\filezilla-bridge.exe --pid 1234 files list --session session-1 --limit 100
-.\filezilla-bridge.exe --pid 1234 refresh --session session-1
+.\filezilla-bridge.exe --pid 1234 files list --session s-1 --limit 100
+.\filezilla-bridge.exe --pid 1234 refresh --session s-1
 .\filezilla-bridge.exe queue summary
 .\filezilla-bridge.exe mcp
 ```

@@ -1,5 +1,5 @@
 diff --git a/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
-index 64122ee..cbee717 100644
+index 64122ee..4a807fc 100644
 --- a/src/interface/Mainfrm.cpp
 +++ b/src/interface/Mainfrm.cpp
 @@ -1,5 +1,6 @@
@@ -29,7 +29,21 @@ index 64122ee..cbee717 100644
  	options_.unwatch_all(this);
  
  	CPowerManagement::Destroy();
-@@ -820,6 +830,22 @@ void CMainFrame::OnMenuHandler(wxCommandEvent &event)
+@@ -604,6 +614,13 @@ void CMainFrame::OnSize(wxSizeEvent &event)
+ #endif
+ }
+ 
++#ifdef __WXMSW__
++void CMainFrame::ForgetApiSession(CState* state)
++{
++	if (local_api_) local_api_->ForgetSession(state);
++}
++#endif
++
+ void CMainFrame::CreateMenus()
+ {
+ 	wxGetApp().AddStartupProfileRecord("CMainFrame::CreateMenus"sv);
+@@ -820,6 +837,22 @@ void CMainFrame::OnMenuHandler(wxCommandEvent &event)
  			}
  		}
  	}
@@ -52,7 +66,7 @@ index 64122ee..cbee717 100644
  	else if (id == XRCID("ID_MENU_AUTOREFRESH_ENABLE")) {
  		bool const enable = options_.get_int(OPTION_AUTOREFRESH_ALL_TABS) == 0;
  		options_.set(OPTION_AUTOREFRESH_ALL_TABS, enable ? 1 : 0);
-@@ -1372,6 +1398,9 @@ void CMainFrame::OnClose(wxCloseEvent &event)
+@@ -1372,6 +1405,9 @@ void CMainFrame::OnClose(wxCloseEvent &event)
  		if (m_pToolBar) {
  			options_.set(OPTION_TOOLBAR_HIDDEN, m_pToolBar->IsShown() ? 0 : 1);
  		}
@@ -63,7 +77,7 @@ index 64122ee..cbee717 100644
  		m_bQuit = true;
  	}
 diff --git a/src/interface/Mainfrm.h b/src/interface/Mainfrm.h
-index 06f311e..0d7ca7d 100644
+index 06f311e..cfc3bb0 100644
 --- a/src/interface/Mainfrm.h
 +++ b/src/interface/Mainfrm.h
 @@ -34,6 +34,9 @@ class CWindowStateManager;
@@ -76,7 +90,17 @@ index 06f311e..0d7ca7d 100644
  
  class CMainFrame final : public wxNavigationEnabled<wxFrame>, public COptionChangeEventHandler
  #if FZ_MANUALUPDATECHECK
-@@ -216,6 +219,9 @@ private:
+@@ -67,6 +70,9 @@ public:
+ 	void PostInitialize();
+ 
+ 	void RefreshAllTabs();
++#ifdef __WXMSW__
++	void ForgetApiSession(CState* state);
++#endif
+ 
+ 	CContextControl* GetContextControl() { return m_pContextControl; }
+ 
+@@ -216,6 +222,9 @@ private:
  #endif
  
  	wxTimer startupTimer_;
@@ -141,12 +165,27 @@ index 4663b0e..c9e335e 100644
  
  	// Has to be last element
  	OPTIONS_NUM
+diff --git a/src/interface/context_control.cpp b/src/interface/context_control.cpp
+index f878dd8..6bdeb52 100644
+--- a/src/interface/context_control.cpp
++++ b/src/interface/context_control.cpp
+@@ -488,6 +488,10 @@ bool CContextControl::CloseTab(int tab)
+ 	}
+ 
+ 	pState->Disconnect();
++#ifdef __WXMSW__
++	// Closed tabs retain their state for reuse, but API IDs belong to tab lifetimes.
++	m_mainFrame.ForgetApiSession(pState);
++#endif
+ 
+ 	return true;
+ }
 diff --git a/src/interface/local_api.cpp b/src/interface/local_api.cpp
 new file mode 100644
-index 0000000..4006a72
+index 0000000..571e973
 --- /dev/null
 +++ b/src/interface/local_api.cpp
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,462 @@
 +#include "filezilla.h"
 +#include "local_api.h"
 +
@@ -154,6 +193,7 @@ index 0000000..4006a72
 +#include "Mainfrm.h"
 +#include "QueueView.h"
 +#include "dialogex.h"
++#include "context_control.h"
 +#include "../include/directorylisting.h"
 +#include <sddl.h>
 +#include <algorithm>
@@ -252,8 +292,20 @@ index 0000000..4006a72
 +void LocalApi::OnStateChange(CState* state, t_statechange_notifications notification, std::wstring const&, void const*)
 +{
 +	if (notification == STATECHANGE_REMOVECONTEXT) {
-+		ids_.erase(state);
++		ForgetSession(state);
 +	}
++}
++
++void LocalApi::ForgetSession(CState* state)
++{
++	ids_.erase(state);
++}
++
++bool LocalApi::IsSession(CState* state) const
++{
++	auto* context = frame_.GetContextControl();
++	auto* controls = context ? context->GetControlsFromState(state) : nullptr;
++	return controls && controls->used();
 +}
 +
 +std::string LocalApi::Id(CState* state)
@@ -515,6 +567,7 @@ index 0000000..4006a72
 +		result["sessions"] = fz::json(fz::json_type::array);
 +		size_t index{};
 +		for (auto* state : *CContextManager::Get()->GetAllStates()) {
++			if (!IsSession(state)) continue;
 +			auto& entry = result["sessions"][index++];
 +			auto const& site = state->GetSite();
 +			entry["id"] = Id(state);
@@ -538,7 +591,7 @@ index 0000000..4006a72
 +		if (params["session"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
 +		CState* selected{};
 +		for (auto* state : *CContextManager::Get()->GetAllStates()) {
-+			if (Id(state) == params["session"].string_value()) selected = state;
++			if (IsSession(state) && Id(state) == params["session"].string_value()) selected = state;
 +		}
 +		if (!selected) return ErrorResponse(id, -32602, "Unknown session");
 +		result["session"] = Id(selected);
@@ -597,10 +650,10 @@ index 0000000..4006a72
 +#endif
 diff --git a/src/interface/local_api.h b/src/interface/local_api.h
 new file mode 100644
-index 0000000..91c8f35
+index 0000000..bff8c23
 --- /dev/null
 +++ b/src/interface/local_api.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,55 @@
 +#ifndef FILEZILLA_INTERFACE_LOCAL_API_HEADER
 +#define FILEZILLA_INTERFACE_LOCAL_API_HEADER
 +
@@ -623,6 +676,7 @@ index 0000000..91c8f35
 +	~LocalApi();
 +	void Start();
 +	void Stop();
++	void ForgetSession(CState* state);
 +	wxString Status();
 +
 +private:
@@ -634,6 +688,7 @@ index 0000000..91c8f35
 +	fz::json Dispatch(fz::json const& request, ULONGLONG deadline);
 +	void OnStateChange(CState*, t_statechange_notifications, std::wstring const&, void const*) override;
 +	std::string Id(CState* state);
++	bool IsSession(CState* state) const;
 +	void Error(DWORD code);
 +
 +	CMainFrame& frame_;

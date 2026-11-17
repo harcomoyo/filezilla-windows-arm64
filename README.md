@@ -85,15 +85,31 @@ to be `filezilla.exe`. This rejects a pipe claimed by an unrelated process;
 it is not a code-signature check and does not establish trust in arbitrary
 executables renamed by the same Windows user.
 
-The existing CI uploads `filezilla_arm64` (patched application). Publish the
-bridge locally with the command above. A separate bridge CI job is prepared in
-local commit `6779de9`, but was not pushed because the current GitHub OAuth
-grant lacks the `workflow` scope. This branch deliberately preserves the
-existing workflow and does not request additional account permissions.
-Mock bridge tests do not
-replace validation against a running patched FileZilla instance. Live testing
-must use a separate configuration and must not replace or close an existing
-FileZilla session without permission.
+Native CI run `44010298129` succeeded; download its `filezilla_arm64` artifact.
+The bridge was published locally with the command above; 19 protocol/pipe test
+groups passed. A separate bridge CI job is prepared in local-only commit
+`6779de9`, but was not pushed because the current GitHub OAuth grant lacks the
+`workflow` scope. The published bridge executable is ARM64 .NET 8 self-contained.
+
+Real native integration was tested using the CI build and a fresh empty config
+(no `sitemanager.xml`, credentials or keys copied):
+
+- API is disabled by default; the actual **Server > API > Enabled** menu toggle
+  opened and closed the pipe endpoint.
+- `api.info`, `sessions.list`, unavailable cached `sessions.files`, and empty
+  `queue.summary` worked through the CLI; MCP handshake and `sessions_list`
+  forwarded to the same native API.
+- API requests worked while the isolated FileZilla window was minimized and the
+  terminal had foreground focus.
+- Two blank tabs appeared as separate contexts. Closing/reopening one produced
+  a fresh session ID; requests using the closed ID were rejected.
+- Disconnected refresh was rejected; duplicate JSON properties were rejected;
+  notifications got no response; disabling the API removed its pipe; graceful
+  FileZilla shutdown joined the API worker.
+
+No connected FTP/SFTP site or non-empty server listing was tested. Thus real
+server listing freshness/refresh remains unverified. The build is not installed
+over a live FileZilla instance and no MCP client configuration is registered.
 
 ## Running FileZilla
 

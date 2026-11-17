@@ -10,11 +10,11 @@ internal static class Tools
         ("sessions_files", "sessions.files", "Read a session's cached remote directory listing, with optional pagination.", true, false),
         ("sessions_refresh", "sessions.refresh", "Request a non-destructive refresh of a session's remote listing.", false, false),
         ("queue_summary", "queue.summary", "Read the transfer queue summary.", true, false),
-        ("sessions_cwd", "sessions.cwd", "Change the remote directory using a site-relative POSIX path or an absolute POSIX path under the site root. Native validates root containment.", false, false),
-        ("transfers_download", "transfers.download", "Download a site-relative POSIX path into the site's local mirror root, overwriting an existing local file. Optional local_path is relative to that local root and defaults to path.", false, false),
-        ("transfers_upload", "transfers.upload", "Upload a relative POSIX path from the site's local mirror root to the matching path under its remote root. May overwrite remote data; requires native authorization.", false, true),
+        ("sessions_cwd", "sessions.cwd", "Change the remote directory using a site-relative POSIX path or an absolute POSIX path under the site root. site must match the session's current site.", false, false),
+        ("transfers_download", "transfers.download", "Download a site-relative POSIX path into the site's local mirror root, overwriting an existing local file. site must match the session's current site; optional local_path is relative to that local root and defaults to path.", false, false),
+        ("transfers_upload", "transfers.upload", "Upload a relative POSIX path from the site's local mirror root to the matching path under its remote root. site must match the session's current site. May overwrite remote data.", false, true),
         ("jobs_status", "jobs.status", "Read API job metadata and the transfer queue summary, optionally for one job.", true, false),
-        ("fs_prepare", "fs.prepare", "Prepare an expiring mkdir, rename, or delete plan using relative POSIX paths under the site's remote root, without executing it.", false, false),
+        ("fs_prepare", "fs.prepare", "Prepare an expiring mkdir, rename, or delete plan using relative POSIX paths under the site's remote root, without executing it. site must match the session's current site.", false, false),
         ("fs_commit", "fs.commit", "Execute a previously prepared remote filesystem plan. May rename or delete remote data.", false, true)
     ];
 
@@ -64,11 +64,11 @@ internal static class Tools
     {
         "sessions.files" => ["session", "offset", "limit"],
         "sessions.refresh" => ["session"],
-        "sessions.cwd" => ["session", "path"],
-        "transfers.download" => ["session", "path", "local_path"],
-        "transfers.upload" => ["session", "path"],
+        "sessions.cwd" => ["session", "site", "path"],
+        "transfers.download" => ["session", "site", "path", "local_path"],
+        "transfers.upload" => ["session", "site", "path"],
         "jobs.status" => ["job"],
-        "fs.prepare" => ["session", "op", "path", "from", "to"],
+        "fs.prepare" => ["session", "site", "op", "path", "from", "to"],
         "fs.commit" => ["plan_id"],
         "sessions.list" or "queue.summary" or "api.info" => [],
         _ => throw new BridgeException("Unsupported native method.")
@@ -77,9 +77,9 @@ internal static class Tools
     private static string[] Required(string method) => method switch
     {
         "sessions.files" or "sessions.refresh" => ["session"],
-        "sessions.cwd" => ["session", "path"],
-        "transfers.download" or "transfers.upload" => ["session", "path"],
-        "fs.prepare" => ["session", "op"],
+        "sessions.cwd" => ["session", "site", "path"],
+        "transfers.download" or "transfers.upload" => ["session", "site", "path"],
+        "fs.prepare" => ["session", "site", "op"],
         "fs.commit" => ["plan_id"],
         _ => []
     };

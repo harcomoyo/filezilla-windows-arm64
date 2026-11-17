@@ -24,7 +24,7 @@ internal static class BridgeApp
                 return await McpServer.RunAsync(input, output, diagnostics, native, pid);
             if (args.SequenceEqual(new[] { "--help" }))
             {
-                await diagnostics.WriteLineAsync("filezilla-bridge [--pid PID] mcp | sessions list | files list --session ID [--offset N] [--limit N] | refresh --session ID | queue summary | info | cwd --session S --path P | download --session S --path REL [--local-path REL] | upload --session S --path REL | jobs status [--job J] | fs prepare --session S --op mkdir|rename|delete [--path REL | --from REL --to REL] | fs commit --plan ID\nREL is a relative POSIX path under the site's root. cwd also accepts an absolute POSIX path under the site root. Native validates root containment.");
+                await diagnostics.WriteLineAsync("filezilla-bridge [--pid PID] mcp | sessions list | files list --session ID [--offset N] [--limit N] | refresh --session ID | queue summary | info | cwd --session S --site NAME --path P | download --session S --site NAME --path REL [--local-path REL] | upload --session S --site NAME --path REL | jobs status [--job J] | fs prepare --session S --site NAME --op mkdir|rename|delete [--path REL | --from REL --to REL] | fs commit --plan ID\nREL is a relative POSIX path under the site's root. cwd also accepts an absolute POSIX path under the site root. NAME must match the session's current site; native validates site and root containment.");
                 return 0;
             }
             string method;
@@ -45,7 +45,7 @@ internal static class BridgeApp
             for (int i = skip; i < args.Count; i += 2)
             {
                 string option = args[i];
-                if (i + 1 >= args.Count || option is not ("--session" or "--offset" or "--limit" or "--path" or "--local-path" or
+                if (i + 1 >= args.Count || option is not ("--session" or "--site" or "--offset" or "--limit" or "--path" or "--local-path" or
                     "--job" or "--op" or "--from" or "--to" or "--plan"))
                     throw new BridgeException("Unknown, repeated, or incomplete option.");
                 string key = option == "--plan" ? "plan_id" : option[2..].Replace('-', '_');

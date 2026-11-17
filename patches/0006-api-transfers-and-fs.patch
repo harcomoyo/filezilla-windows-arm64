@@ -1,37 +1,3 @@
-diff --git a/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
-index 4a807fc..c702e60 100644
---- a/src/interface/Mainfrm.cpp
-+++ b/src/interface/Mainfrm.cpp
-@@ -843,10 +843,29 @@ void CMainFrame::OnMenuHandler(wxCommandEvent &event)
- 			bool const enabled = options_.get_int(OPTION_LOCAL_API_ENABLED) == 0;
- 			options_.set(OPTION_LOCAL_API_ENABLED, enabled ? 1 : 0);
- 			m_pMenuBar->Check(XRCID("ID_MENU_API_ENABLE"), enabled);
-+			m_pMenuBar->Enable(XRCID("ID_MENU_API_ALLOW_CHANGES"), enabled);
- 			if (enabled) local_api_->Start();
- 			else local_api_->Stop();
- 		}
- 	}
-+	else if (id == XRCID("ID_MENU_API_ALLOW_CHANGES")) {
-+		if (local_api_) {
-+			if (event.IsChecked()) {
-+				if (!local_api_->ArmMutations()) {
-+					m_pMenuBar->Check(XRCID("ID_MENU_API_ALLOW_CHANGES"), false);
-+					if (options_.get_int(OPTION_LOCAL_API_ENABLED)) {
-+						wxMessageBoxEx(_("The local API is not running."), _("Local API"), wxOK | wxICON_INFORMATION, this);
-+					}
-+					else {
-+						wxMessageBoxEx(_("Enable the local API before allowing file changes."), _("Local API"), wxOK | wxICON_INFORMATION, this);
-+					}
-+				}
-+			}
-+			else {
-+				local_api_->DisarmMutations();
-+			}
-+		}
-+	}
- 	else if (id == XRCID("ID_MENU_API_STATUS")) {
- 		if (local_api_) {
- 			wxMessageBoxEx(local_api_->Status(), _("Local API status"), wxOK | wxICON_INFORMATION, this);
 diff --git a/src/interface/Makefile.am b/src/interface/Makefile.am
 index c133679..b03cf7b 100644
 --- a/src/interface/Makefile.am
@@ -93,23 +59,20 @@ index 92da0f7..7c29863 100644
  			CFileExistsNotification::OverwriteAction action = pFileExistsNotification->overwriteAction;
  			if (action == CFileExistsNotification::unknown) {
 diff --git a/src/interface/local_api.cpp b/src/interface/local_api.cpp
-index 507b04c..f8e5425 100644
+index 507b04c..748bcd5 100644
 --- a/src/interface/local_api.cpp
 +++ b/src/interface/local_api.cpp
-@@ -3,17 +3,28 @@
+@@ -3,17 +3,25 @@
  
  #ifdef __WXMSW__
  #include "Mainfrm.h"
 +#include "api_hooks.h"
-+#include "Options.h"
  #include "QueueView.h"
  #include "context_control.h"
 +#include "../include/commands.h"
  #include "../include/directorylisting.h"
  #include <sddl.h>
 +#include <wx/filename.h>
-+#include <wx/menu.h>
-+#include <wx/xrc/xmlres.h>
  #include <algorithm>
 +#include <ctime>
 +#include <cwchar>
@@ -125,7 +88,7 @@ index 507b04c..f8e5425 100644
  
  bool Members(fz::json const& value, std::initializer_list<char const*> allowed)
  {
-@@ -86,6 +97,602 @@ bool Integer(fz::json const& value, int64_t& result)
+@@ -86,6 +94,626 @@ bool Integer(fz::json const& value, int64_t& result)
  	result = *number;
  	return true;
  }
@@ -504,6 +467,11 @@ index 507b04c..f8e5425 100644
 +bool EnsureLocalDir(std::wstring const& path, std::wstring const& root, bool& reparse)
 +{
 +	reparse = false;
++	// Only create subdirectories below the already validated mirror root.
++	DWORD const rootAttributes = GetFileAttributesW(root.c_str());
++	if (rootAttributes == INVALID_FILE_ATTRIBUTES || (rootAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
++		return false;
++	}
 +	wxFileName::Mkdir(path, 0777, wxPATH_MKDIR_FULL);
 +	DWORD attributes = GetFileAttributesW(path.c_str());
 +	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
@@ -557,20 +525,22 @@ index 507b04c..f8e5425 100644
 +	std::wstring local;
 +};
 +
-+bool SiteRoots(Site const& site, Roots& roots)
++// Returns nullptr on success. The local mirror root must already exist; API
++// calls only create subdirectories below it.
++char const* SiteRoots(Site const& site, Roots& roots)
 +{
 +	auto name = site.GetName();
 +	if (name.empty()) {
-+		return false;
++		return "Site has no API roots";
 +	}
 +	auto appdata = EnvValue(L"APPDATA");
 +	std::string text;
 +	if (appdata.empty() || !ReadUtf8File(appdata + L"\\FileZilla\\api-roots.json", text)) {
-+		return false;
++		return "Site has no API roots";
 +	}
 +	auto document = fz::json::parse(text);
 +	if (!document || !document.is_object()) {
-+		return false;
++		return "Site has no API roots";
 +	}
 +	auto const& rootsJson = document;
 +	auto find = [&rootsJson](std::string const& key, fz::json& entry) {
@@ -583,29 +553,46 @@ index 507b04c..f8e5425 100644
 +		found = find(ToUtf8(name.substr(0, name.size() - 4)), entry);
 +	}
 +	if (!found || !entry.is_object()) {
-+		return false;
++		return "Site has no API roots";
 +	}
 +	auto const& remoteNode = entry["remote"];
 +	auto const& localNode = entry["local"];
 +	if (remoteNode.type() != fz::json_type::string || localNode.type() != fz::json_type::string) {
-+		return false;
++		return "Site has no API roots";
 +	}
 +	auto remoteText = FromUtf8(remoteNode.string_value());
 +	auto localText = FromUtf8(localNode.string_value());
 +	if (remoteText.empty() || localText.empty() || HasControlChars(remoteText) || HasControlChars(localText) || !IsAbsoluteLocal(localText)) {
-+		return false;
++		return "Site has no API roots";
 +	}
 +	CServerPath remote;
 +	if (!ParseRemotePath(remoteText, site.server.GetType(), remote)) {
-+		return false;
++		return "Site has no API roots";
 +	}
 +	auto local = TrimLocalRoot(CanonicalLocal(localText));
 +	if (local.empty()) {
-+		return false;
++		return "Site has no API roots";
++	}
++	DWORD const attributes = GetFileAttributesW(local.c_str());
++	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
++		return "Local mirror root missing";
 +	}
 +	roots.remote = std::move(remote);
 +	roots.local = std::move(local);
-+	return true;
++	return {};
++}
++
++// A request may name the session's site exactly, or without the ".xml" suffix
++// that SiteRoots also accepts.
++bool SiteNameMatches(std::wstring const& requested, std::wstring const& current)
++{
++	if (requested.empty()) {
++		return false;
++	}
++	if (requested == current) {
++		return true;
++	}
++	return current.size() > 4 && current.compare(current.size() - 4, 4, L".xml") == 0 && requested == current.substr(0, current.size() - 4);
 +}
 +
 +std::string AuditField(std::wstring const& text)
@@ -728,7 +715,7 @@ index 507b04c..f8e5425 100644
  }
  
  LocalApi::LocalApi(CMainFrame& frame)
-@@ -128,6 +735,55 @@ std::string LocalApi::Id(CState* state)
+@@ -128,6 +756,28 @@ std::string LocalApi::Id(CState* state)
  	return id;
  }
  
@@ -740,33 +727,6 @@ index 507b04c..f8e5425 100644
 +		}
 +	}
 +	return nullptr;
-+}
-+
-+bool LocalApi::MutationsArmed()
-+{
-+	if (armed_until_ && GetTickCount64() >= armed_until_) {
-+		armed_until_ = 0;
-+		plans_.clear();
-+	}
-+	return armed_until_ != 0;
-+}
-+
-+bool LocalApi::ArmMutations()
-+{
-+	if (pipe_ == INVALID_HANDLE_VALUE || !timer_.IsRunning() || frame_.GetOptions().get_int(OPTION_LOCAL_API_ENABLED) == 0) {
-+		return false;
-+	}
-+	armed_until_ = GetTickCount64() + 600000;
-+	return true;
-+}
-+
-+void LocalApi::DisarmMutations()
-+{
-+	armed_until_ = 0;
-+	plans_.clear();
-+	if (auto* menuBar = frame_.GetMenuBar()) {
-+		menuBar->Check(XRCID("ID_MENU_API_ALLOW_CHANGES"), false);
-+	}
 +}
 +
 +void LocalApi::Audit(std::string const& method, std::wstring const& site, std::vector<std::wstring> const& paths, std::string const& result)
@@ -784,40 +744,22 @@ index 507b04c..f8e5425 100644
  wxString LocalApi::Status()
  {
  	std::lock_guard<std::mutex> lock(mutex_);
-@@ -206,6 +862,7 @@ void LocalApi::Start()
- void LocalApi::Stop()
- {
- 	timer_.Stop();
-+	DisarmMutations();
- 	if (stop_) SetEvent(stop_);
- 	if (worker_.joinable()) worker_.join();
- 	if (pipe_ != INVALID_HANDLE_VALUE) CloseHandle(pipe_);
-@@ -331,6 +988,9 @@ std::string LocalApi::Exchange(std::string const& line)
- 
- void LocalApi::Tick(wxTimerEvent&)
- {
-+	if (auto* menuBar = frame_.GetMenuBar()) {
-+		menuBar->Check(XRCID("ID_MENU_API_ALLOW_CHANGES"), MutationsArmed());
-+	}
- 	std::lock_guard<std::mutex> lock(mutex_);
- 	if (!pending_) return;
- 	auto request = fz::json::parse(request_);
-@@ -359,7 +1019,13 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+@@ -359,7 +1009,13 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
  		return ErrorResponse(id, -32602, "Method takes no params");
  	}
  	if ((method == "sessions.refresh" && !Members(params, {"session"})) ||
 -		(method == "sessions.files" && !Members(params, {"session", "offset", "limit"}))) {
 +		(method == "sessions.files" && !Members(params, {"session", "offset", "limit"})) ||
-+		(method == "sessions.cwd" && !Members(params, {"session", "path"})) ||
-+		(method == "transfers.download" && !Members(params, {"session", "path", "local_path"})) ||
-+		(method == "transfers.upload" && !Members(params, {"session", "path"})) ||
++		(method == "sessions.cwd" && !Members(params, {"session", "path", "site"})) ||
++		(method == "transfers.download" && !Members(params, {"session", "path", "local_path", "site"})) ||
++		(method == "transfers.upload" && !Members(params, {"session", "path", "site"})) ||
 +		(method == "jobs.status" && !Members(params, {"job"})) ||
-+		(method == "fs.prepare" && !Members(params, {"session", "op", "path", "from", "to"})) ||
++		(method == "fs.prepare" && !Members(params, {"session", "op", "path", "from", "to", "site"})) ||
 +		(method == "fs.commit" && !Members(params, {"plan_id"}))) {
  		return ErrorResponse(id, -32602, "Unknown params member");
  	}
  	fz::json result;
-@@ -448,6 +1114,12 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+@@ -448,6 +1104,12 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
  			if (end < total) result["next_offset"] = end;
  		}
  	}
@@ -830,7 +772,7 @@ index 507b04c..f8e5425 100644
  	else return ErrorResponse(id, -32601, "Method not found");
  	fz::json reply;
  	reply["jsonrpc"] = "2.0";
-@@ -455,4 +1127,529 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+@@ -455,4 +1117,560 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
  	reply["result"] = std::move(result);
  	return reply;
  }
@@ -850,10 +792,17 @@ index 507b04c..f8e5425 100644
 +		Audit("sessions.cwd", site.GetName(), {}, "error -32001");
 +		return ErrorResponse(id, -32001, "Disable synchronized browsing before API directory changes");
 +	}
++	auto const& siteParam = params["site"];
++	if (siteParam && !siteParam.is_null() && siteParam.type() != fz::json_type::string) return ErrorResponse(id, -32602, "site must be a string");
++	auto requestedSite = siteParam.type() == fz::json_type::string ? FromUtf8(siteParam.string_value()) : std::wstring();
++	if (!SiteNameMatches(requestedSite, site.GetName())) {
++		Audit("sessions.cwd", site.GetName(), {requestedSite}, "error -32004 site mismatch");
++		return ErrorResponse(id, -32004, "Site mismatch");
++	}
 +	Roots roots;
-+	if (!SiteRoots(site, roots)) {
++	if (auto rootsError = SiteRoots(site, roots)) {
 +		Audit("sessions.cwd", site.GetName(), {}, "error -32004");
-+		return ErrorResponse(id, -32004, "Site has no API roots");
++		return ErrorResponse(id, -32004, rootsError);
 +	}
 +	if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
 +	std::wstring requested = FromUtf8(params["path"].string_value());
@@ -894,10 +843,17 @@ index 507b04c..f8e5425 100644
 +		Audit("transfers.download", site.GetName(), {}, "error -32007");
 +		return ErrorResponse(id, -32007, "Session not connected or busy");
 +	}
++	auto const& siteParam = params["site"];
++	if (siteParam && !siteParam.is_null() && siteParam.type() != fz::json_type::string) return ErrorResponse(id, -32602, "site must be a string");
++	auto requestedSite = siteParam.type() == fz::json_type::string ? FromUtf8(siteParam.string_value()) : std::wstring();
++	if (!SiteNameMatches(requestedSite, site.GetName())) {
++		Audit("transfers.download", site.GetName(), {requestedSite}, "error -32004 site mismatch");
++		return ErrorResponse(id, -32004, "Site mismatch");
++	}
 +	Roots roots;
-+	if (!SiteRoots(site, roots)) {
++	if (auto rootsError = SiteRoots(site, roots)) {
 +		Audit("transfers.download", site.GetName(), {}, "error -32004");
-+		return ErrorResponse(id, -32004, "Site has no API roots");
++		return ErrorResponse(id, -32004, rootsError);
 +	}
 +	if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
 +	std::wstring relative = FromUtf8(params["path"].string_value());
@@ -1001,7 +957,6 @@ index 507b04c..f8e5425 100644
 +
 +fz::json LocalApi::Upload(fz::json const& id, fz::json const& params)
 +{
-+	if (!MutationsArmed()) return ErrorResponse(id, -32003, "File changes are not armed");
 +	auto const& session = params["session"];
 +	if (session.type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
 +	auto* state = Session(session.string_value());
@@ -1011,10 +966,17 @@ index 507b04c..f8e5425 100644
 +		Audit("transfers.upload", site.GetName(), {}, "error -32007");
 +		return ErrorResponse(id, -32007, "Session not connected or busy");
 +	}
++	auto const& siteParam = params["site"];
++	if (siteParam && !siteParam.is_null() && siteParam.type() != fz::json_type::string) return ErrorResponse(id, -32602, "site must be a string");
++	auto requestedSite = siteParam.type() == fz::json_type::string ? FromUtf8(siteParam.string_value()) : std::wstring();
++	if (!SiteNameMatches(requestedSite, site.GetName())) {
++		Audit("transfers.upload", site.GetName(), {requestedSite}, "error -32004 site mismatch");
++		return ErrorResponse(id, -32004, "Site mismatch");
++	}
 +	Roots roots;
-+	if (!SiteRoots(site, roots)) {
++	if (auto rootsError = SiteRoots(site, roots)) {
 +		Audit("transfers.upload", site.GetName(), {}, "error -32004");
-+		return ErrorResponse(id, -32004, "Site has no API roots");
++		return ErrorResponse(id, -32004, rootsError);
 +	}
 +	if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
 +	std::wstring relative = FromUtf8(params["path"].string_value());
@@ -1119,7 +1081,6 @@ index 507b04c..f8e5425 100644
 +
 +fz::json LocalApi::Prepare(fz::json const& id, fz::json const& params)
 +{
-+	if (!MutationsArmed()) return ErrorResponse(id, -32003, "File changes are not armed");
 +	auto const& session = params["session"];
 +	if (session.type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
 +	auto* state = Session(session.string_value());
@@ -1129,16 +1090,23 @@ index 507b04c..f8e5425 100644
 +		Audit("fs.prepare", site.GetName(), {}, "error -32007");
 +		return ErrorResponse(id, -32007, "Session not connected or busy");
 +	}
++	auto const& siteParam = params["site"];
++	if (siteParam && !siteParam.is_null() && siteParam.type() != fz::json_type::string) return ErrorResponse(id, -32602, "site must be a string");
++	auto requestedSite = siteParam.type() == fz::json_type::string ? FromUtf8(siteParam.string_value()) : std::wstring();
++	if (!SiteNameMatches(requestedSite, site.GetName())) {
++		Audit("fs.prepare", site.GetName(), {requestedSite}, "error -32004 site mismatch");
++		return ErrorResponse(id, -32004, "Site mismatch");
++	}
 +	Roots roots;
-+	if (!SiteRoots(site, roots)) {
++	if (auto rootsError = SiteRoots(site, roots)) {
 +		Audit("fs.prepare", site.GetName(), {}, "error -32004");
-+		return ErrorResponse(id, -32004, "Site has no API roots");
++		return ErrorResponse(id, -32004, rootsError);
 +	}
 +	if (params["op"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "op must be a string");
 +	std::string op = params["op"].string_value();
 +	if (op != "mkdir" && op != "rename" && op != "delete") return ErrorResponse(id, -32009, "Unsupported operation");
-+	if ((op == "rename" && !Members(params, {"session", "op", "from", "to"})) ||
-+		(op != "rename" && !Members(params, {"session", "op", "path"}))) {
++	if ((op == "rename" && !Members(params, {"session", "op", "from", "to", "site"})) ||
++		(op != "rename" && !Members(params, {"session", "op", "path", "site"}))) {
 +		return ErrorResponse(id, -32602, "Unknown params member");
 +	}
 +	auto now = GetTickCount64();
@@ -1159,6 +1127,7 @@ index 507b04c..f8e5425 100644
 +	Plan plan;
 +	plan.op = op;
 +	plan.session = Id(state);
++	plan.site = site.GetName();
 +	plan.expiry = now + 60000;
 +	fz::json summary;
 +	std::vector<std::wstring> auditPaths;
@@ -1292,7 +1261,6 @@ index 507b04c..f8e5425 100644
 +
 +fz::json LocalApi::Commit(fz::json const& id, fz::json const& params)
 +{
-+	if (!MutationsArmed()) return ErrorResponse(id, -32003, "File changes are not armed");
 +	if (params["plan_id"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "plan_id must be a string");
 +	auto planId = params["plan_id"].string_value();
 +	auto now = GetTickCount64();
@@ -1312,8 +1280,13 @@ index 507b04c..f8e5425 100644
 +	if (!state->IsRemoteConnected() || !state->IsRemoteIdle()) {
 +		return ErrorResponse(id, -32007, "Session not connected or busy");
 +	}
++	if (!SiteNameMatches(plan.site, site.GetName())) {
++		plans_.erase(found);
++		Audit("fs.commit", site.GetName(), {plan.site}, "error -32004 site mismatch");
++		return ErrorResponse(id, -32004, "Site mismatch");
++	}
 +	Roots roots;
-+	if (!SiteRoots(site, roots)) return ErrorResponse(id, -32004, "Site has no API roots");
++	if (auto rootsError = SiteRoots(site, roots)) return ErrorResponse(id, -32004, rootsError);
 +	CServerPath remote, from, to;
 +	std::wstring localFrom, localTo;
 +	if (plan.op == "mkdir" || plan.op == "delete") {
@@ -1361,7 +1334,7 @@ index 507b04c..f8e5425 100644
 +}
  #endif
 diff --git a/src/interface/local_api.h b/src/interface/local_api.h
-index bff8c23..a0ea901 100644
+index bff8c23..93dc71e 100644
 --- a/src/interface/local_api.h
 +++ b/src/interface/local_api.h
 @@ -5,9 +5,12 @@
@@ -1377,17 +1350,7 @@ index bff8c23..a0ea901 100644
  #include <windows.h>
  
  class CMainFrame;
-@@ -22,6 +25,9 @@ public:
- 	void Stop();
- 	void ForgetSession(CState* state);
- 	wxString Status();
-+	bool MutationsArmed();
-+	bool ArmMutations();
-+	void DisarmMutations();
- 
- private:
- 	void Tick(wxTimerEvent&);
-@@ -30,15 +36,46 @@ private:
+@@ -30,15 +33,46 @@ private:
  	bool FinishIo(OVERLAPPED& ov, BOOL immediate, ULONGLONG deadline, DWORD& transferred);
  	std::string Exchange(std::string const& line);
  	fz::json Dispatch(fz::json const& request, ULONGLONG deadline);
@@ -1407,6 +1370,7 @@ index bff8c23..a0ea901 100644
 +	struct Plan {
 +		std::string op;
 +		std::string session;
++		std::wstring site;
 +		std::wstring path;
 +		std::wstring from;
 +		std::wstring to;
@@ -1430,22 +1394,6 @@ index bff8c23..a0ea901 100644
 +	uint64_t next_plan_{};
 +	std::vector<Job> jobs_;
 +	uint64_t next_job_{};
-+	ULONGLONG armed_until_{};
  	HANDLE pipe_{INVALID_HANDLE_VALUE};
  	HANDLE stop_{};
  	HANDLE done_{};
-diff --git a/src/interface/menu_bar.cpp b/src/interface/menu_bar.cpp
-index f5b2b02..ac82083 100644
---- a/src/interface/menu_bar.cpp
-+++ b/src/interface/menu_bar.cpp
-@@ -139,8 +139,10 @@ CMenuBar::CMenuBar(CMainFrame& mainFrame, COptions& options)
- 	wxMenu* api = new wxMenu;
- 	server->AppendSubMenu(api, _("&API"));
- 	api->AppendCheckItem(XRCID("ID_MENU_API_ENABLE"), _("&Enabled"));
-+	api->Append(XRCID("ID_MENU_API_ALLOW_CHANGES"), _("Allow file changes (10 min)"), L"", wxITEM_CHECK);
- 	api->Append(XRCID("ID_MENU_API_STATUS"), _("&Status / error..."));
- 	Check(XRCID("ID_MENU_API_ENABLE"), options_.get_int(OPTION_LOCAL_API_ENABLED) != 0);
-+	api->Enable(XRCID("ID_MENU_API_ALLOW_CHANGES"), options_.get_int(OPTION_LOCAL_API_ENABLED) != 0);
- #endif
- 
- 	wxMenu* bookmarks = new wxMenu;

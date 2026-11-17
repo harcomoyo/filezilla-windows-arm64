@@ -51,17 +51,17 @@ internal static class Tests
         {
             (string[] Args, string Method, object Params)[] cases =
             [
-                (["cwd", "--session", "s", "--path", "/pub"], "sessions.cwd", new { session = "s", path = "/pub" }),
-                (["cwd", "--session", "s", "--path", "pub/assets"], "sessions.cwd", new { session = "s", path = "pub/assets" }),
-                (["cwd", "--session", "s", "--path", "/"], "sessions.cwd", new { session = "s", path = "/" }),
-                (["download", "--session", "s", "--path", "assets/source.txt"], "transfers.download", new { session = "s", path = "assets/source.txt" }),
-                (["download", "--session", "s", "--path", "assets/source.txt", "--local-path", "copies/copy.txt"], "transfers.download", new { session = "s", path = "assets/source.txt", local_path = "copies/copy.txt" }),
-                (["upload", "--session", "s", "--path", "assets/file..txt"], "transfers.upload", new { session = "s", path = "assets/file..txt" }),
+                (["cwd", "--session", "s", "--site", "Example Site", "--path", "/pub"], "sessions.cwd", new { session = "s", site = "Example Site", path = "/pub" }),
+                (["cwd", "--session", "s", "--site", "Example Site", "--path", "pub/assets"], "sessions.cwd", new { session = "s", site = "Example Site", path = "pub/assets" }),
+                (["cwd", "--session", "s", "--site", "Example Site", "--path", "/"], "sessions.cwd", new { session = "s", site = "Example Site", path = "/" }),
+                (["download", "--session", "s", "--site", "Example Site", "--path", "assets/source.txt"], "transfers.download", new { session = "s", site = "Example Site", path = "assets/source.txt" }),
+                (["download", "--session", "s", "--site", "Example Site", "--path", "assets/source.txt", "--local-path", "copies/copy.txt"], "transfers.download", new { session = "s", site = "Example Site", path = "assets/source.txt", local_path = "copies/copy.txt" }),
+                (["upload", "--session", "s", "--site", "Example Site", "--path", "assets/file..txt"], "transfers.upload", new { session = "s", site = "Example Site", path = "assets/file..txt" }),
                 (["jobs", "status"], "jobs.status", new { }),
                 (["jobs", "status", "--job", "job-1"], "jobs.status", new { job = "job-1" }),
-                (["fs", "prepare", "--session", "s", "--op", "mkdir", "--path", "new-dir"], "fs.prepare", new { session = "s", op = "mkdir", path = "new-dir" }),
-                (["fs", "prepare", "--session", "s", "--op", "rename", "--from", "old.txt", "--to", "new.txt"], "fs.prepare", new { session = "s", op = "rename", from = "old.txt", to = "new.txt" }),
-                (["fs", "prepare", "--session", "s", "--op", "delete", "--path", "old.txt"], "fs.prepare", new { session = "s", op = "delete", path = "old.txt" }),
+                (["fs", "prepare", "--session", "s", "--site", "Example Site", "--op", "mkdir", "--path", "new-dir"], "fs.prepare", new { session = "s", site = "Example Site", op = "mkdir", path = "new-dir" }),
+                (["fs", "prepare", "--session", "s", "--site", "Example Site", "--op", "rename", "--from", "old.txt", "--to", "new.txt"], "fs.prepare", new { session = "s", site = "Example Site", op = "rename", from = "old.txt", to = "new.txt" }),
+                (["fs", "prepare", "--session", "s", "--site", "Example Site", "--op", "delete", "--path", "old.txt"], "fs.prepare", new { session = "s", site = "Example Site", op = "delete", path = "old.txt" }),
                 (["fs", "commit", "--plan", "opaque-plan"], "fs.commit", new { plan_id = "opaque-plan" })
             ];
             foreach (var item in cases)
@@ -80,19 +80,119 @@ internal static class Tests
                 await mock.Completion;
             }
         });
+        await Test("Site is required nonblank and forwarded verbatim", async () =>
+        {
+            (string Tool, string[] Args, string Method, object ArgsObject)[] calls =
+            [
+                ("sessions_cwd", ["cwd", "--session", "s", "--path", "assets"], "sessions.cwd", new { session = "s", path = "assets" }),
+                ("transfers_download", ["download", "--session", "s", "--path", "assets/file"], "transfers.download", new { session = "s", path = "assets/file" }),
+                ("transfers_upload", ["upload", "--session", "s", "--path", "assets/file"], "transfers.upload", new { session = "s", path = "assets/file" }),
+                ("fs_prepare", ["fs", "prepare", "--session", "s", "--op", "mkdir", "--path", "assets/new"], "fs.prepare", new { session = "s", op = "mkdir", path = "assets/new" })
+            ];
+            foreach (var call in calls)
+            {
+                foreach (string site in new[] { "", "   ", "\t" })
+                {
+                    var cli = await Run([.. call.Args, "--site", site], NoServer());
+                    Equal(1, cli.Code);
+                    Equal("", cli.Output);
+                    Check(!cli.Error.Contains("No verified"), "invalid site must fail before discovery");
+                }
+                var missing = await Run(call.Args, NoServer());
+                Equal(1, missing.Code);
+                Equal("", missing.Output);
+                Check(!missing.Error.Contains("No verified"), "missing site must fail before discovery");
+                var args = Json.Element(call.ArgsObject).EnumerateObject().ToDictionary(p => p.Name, p => (object)p.Value);
+                foreach (string? site in new[] { null, "", "   " })
+                {
+                    var mcpArgs = new Dictionary<string, object>(args);
+                    if (site is null) mcpArgs.Remove("site"); else mcpArgs["site"] = site;
+                    var mcp = await Run(["mcp"], NoServer(), Initialize() + Ready + Request(2, "tools/call", new { name = call.Tool, arguments = mcpArgs }));
+                    Equal(-32602, Code(ParseFrames(mcp.Output)[1]));
+                }
+            }
+            foreach (var (tool, method) in new[] { ("sessions_cwd", "sessions.cwd"), ("transfers_download", "transfers.download"), ("transfers_upload", "transfers.upload"), ("fs_prepare", "fs.prepare") })
+            {
+                await using var mock = new MockPipe(request =>
+                {
+                    Equal(method, request.GetProperty("method").GetString());
+                    Equal("Example Site \u00c5", request.GetProperty("params").GetProperty("site").GetString());
+                    return Success(new { });
+                });
+                object args = tool switch
+                {
+                    "sessions_cwd" => new { session = "s", site = "Example Site \u00c5", path = "assets" },
+                    "transfers_download" => new { session = "s", site = "Example Site \u00c5", path = "assets/file" },
+                    "transfers_upload" => new { session = "s", site = "Example Site \u00c5", path = "assets/file" },
+                    _ => new { session = "s", site = "Example Site \u00c5", op = "mkdir", path = "assets/new" }
+                };
+                var result = await Run(["mcp", "--pid", Pid.ToString()], mock.Client(), Initialize() + Ready + Request(2, "tools/call", new { name = tool, arguments = args }));
+                Check(!ParseFrames(result.Output)[1].GetProperty("result").GetProperty("isError").GetBoolean(), "verbatim site accepted");
+                await mock.Completion;
+            }
+        });
+        await Test("Site schemas are required and fs_commit remains plan-only", async () =>
+        {
+            var tools = Json.Element(Tools.List()).EnumerateArray().ToArray();
+            foreach (string name in new[] { "sessions_cwd", "transfers_download", "transfers_upload", "fs_prepare" })
+            {
+                var schema = tools.Single(t => t.GetProperty("name").GetString() == name).GetProperty("inputSchema");
+                Check(schema.GetProperty("required").EnumerateArray().Any(p => p.GetString() == "site"), "site required in schema");
+                Equal(1, schema.GetProperty("properties").GetProperty("site").GetProperty("minLength").GetInt32());
+            }
+            var commit = tools.Single(t => t.GetProperty("name").GetString() == "fs_commit").GetProperty("inputSchema");
+            Check(!commit.GetProperty("properties").TryGetProperty("site", out _), "fs_commit has no site schema");
+            Equal("plan_id", string.Join(',', commit.GetProperty("required").EnumerateArray().Select(p => p.GetString())));
+            var commitMcp = await Run(["mcp"], NoServer(), Initialize() + Ready + Request(2, "tools/call", new { name = "fs_commit", arguments = new { plan_id = "p", site = "s" } }));
+            Equal(-32602, Code(ParseFrames(commitMcp.Output)[1]));
+            var commitCli = await Run(["fs", "commit", "--plan", "p", "--site", "s"], NoServer());
+            Equal(1, commitCli.Code);
+            Check(!commitCli.Error.Contains("No verified"), "fs_commit site rejected before discovery");
+        });
+        await Test("Descriptions and help contain no arming wording", async () =>
+        {
+            foreach (var tool in Tools.List().Cast<object>())
+            {
+                string json = JsonSerializer.Serialize(tool);
+                Check(!json.Contains("arm", StringComparison.OrdinalIgnoreCase), "tool description must not mention arming");
+            }
+            var help = await Run(["--help"], NoServer());
+            Equal(0, help.Code);
+            Check(!help.Error.Contains("arm", StringComparison.OrdinalIgnoreCase), "help must not mention arming");
+            Check(help.Error.Contains("--site NAME"), "help documents --site");
+        });
+        await Test("Wrong site native error surfaces unchanged in CLI and MCP", async () =>
+        {
+            await using (var mock = new MockPipe(_ => "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32004,\"message\":\"Site mismatch\"}}\n"))
+            {
+                var cli = await Run(["cwd", "--session", "s", "--site", "wrong", "--path", "assets", "--pid", Pid.ToString()], mock.Client());
+                Equal(1, cli.Code);
+                Equal("", cli.Output);
+                Check(cli.Error.Contains("-32004: Site mismatch"), "CLI preserves native site error");
+                await mock.Completion;
+            }
+            await using (var mock = new MockPipe(_ => "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32004,\"message\":\"Site mismatch\"}}\n"))
+            {
+                var result = await Run(["mcp", "--pid", Pid.ToString()], mock.Client(), Initialize() + Ready + Request(2, "tools/call", new { name = "transfers_upload", arguments = new { session = "s", site = "wrong", path = "assets/file" } }));
+                var frame = ParseFrames(result.Output)[1];
+                Check(frame.GetProperty("result").GetProperty("isError").GetBoolean(), "MCP site mismatch is tool error");
+                Check(frame.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString()!.Contains("-32004: Site mismatch"), "MCP preserves native site error");
+                await mock.Completion;
+            }
+        });
         await Test("M2 M3 CLI rejects unsafe relative paths and invalid operation shapes", async () =>
         {
             foreach (string path in new[] { "..", "../file", "dir/../file", "dir/..", "dir/./file", "dir/.", "./file", "C:\\file", "C:/file", "C:file", "\\\\host\\file", "/file", "a\\b", "", ".", "a\n", "a\u007f" })
             {
                 foreach (string[] args in new[]
                 {
-                    new[] { "upload", "--session", "s", "--path", path },
-                    new[] { "download", "--session", "s", "--path", path },
-                    new[] { "download", "--session", "s", "--path", "file", "--local-path", path },
-                    new[] { "fs", "prepare", "--session", "s", "--op", "mkdir", "--path", path },
-                    new[] { "fs", "prepare", "--session", "s", "--op", "delete", "--path", path },
-                    new[] { "fs", "prepare", "--session", "s", "--op", "rename", "--from", path, "--to", "new/file" },
-                    new[] { "fs", "prepare", "--session", "s", "--op", "rename", "--from", "old/file", "--to", path }
+                    new[] { "upload", "--session", "s", "--site", "s", "--path", path },
+                    new[] { "download", "--session", "s", "--site", "s", "--path", path },
+                    new[] { "download", "--session", "s", "--site", "s", "--path", "file", "--local-path", path },
+                    new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "mkdir", "--path", path },
+                    new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "delete", "--path", path },
+                    new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "rename", "--from", path, "--to", "new/file" },
+                    new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "rename", "--from", "old/file", "--to", path }
                 })
                 {
                     var result = await Run(args, NoServer());
@@ -103,17 +203,17 @@ internal static class Tests
             }
             foreach (string[] args in new[]
             {
-                new[] { "upload", "--session", "s" },
-                new[] { "cwd", "--session", "s", "--path", "" },
-                new[] { "cwd", "--session", "s", "--path", "../private" },
-                new[] { "cwd", "--session", "s", "--path", "C:\\private" },
-                new[] { "cwd", "--session", "s", "--path", "/pub/./file" },
-                new[] { "cwd", "--session", "s" }, new[] { "jobs", "status", "--job", "" },
-                new[] { "fs", "prepare", "--session", "s", "--op", "format", "--path", "file" },
-                new[] { "fs", "prepare", "--session", "s", "--op", "rename", "--path", "file" },
-                new[] { "fs", "prepare", "--session", "s", "--op", "rename", "--from", "file" },
-                new[] { "fs", "prepare", "--session", "s", "--op", "delete", "--from", "file", "--to", "file2" },
-                new[] { "fs", "prepare", "--session", "s", "--op", "delete", "--path", "../private" },
+                new[] { "upload", "--session", "s", "--site", "s" },
+                new[] { "cwd", "--session", "s", "--site", "s", "--path", "" },
+                new[] { "cwd", "--session", "s", "--site", "s", "--path", "../private" },
+                new[] { "cwd", "--session", "s", "--site", "s", "--path", "C:\\private" },
+                new[] { "cwd", "--session", "s", "--site", "s", "--path", "/pub/./file" },
+                new[] { "cwd", "--session", "s", "--site", "s" }, new[] { "jobs", "status", "--job", "" },
+                new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "format", "--path", "file" },
+                new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "rename", "--path", "file" },
+                new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "rename", "--from", "file" },
+                new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "delete", "--from", "file", "--to", "file2" },
+                new[] { "fs", "prepare", "--session", "s", "--site", "s", "--op", "delete", "--path", "../private" },
                 new[] { "fs", "commit", "--plan", "" }, new[] { "fs", "commit", "--plan", "p", "--session", "s" }
             })
             {
@@ -149,11 +249,11 @@ internal static class Tests
             Equal("path", variants[1].GetProperty("not").GetProperty("required")[0].GetString());
             object[] invalid =
             [
-                new { session = "s", op = "format", path = "file" }, new { session = "s", op = "rename", path = "file" },
-                new { session = "s", op = "rename", from = "file" }, new { session = "s", op = "rename", to = "file" },
-                new { session = "s", op = "rename", from = "a", to = "b", path = "c" },
-                new { session = "s", op = "delete", from = "a", to = "b" }, new { session = "s", op = "mkdir" },
-                new { session = "s", op = "delete", path = "a", to = "b" }, new { session = "s", op = "mkdir", path = "" }
+                new { session = "s", site = "s", op = "format", path = "file" }, new { session = "s", site = "s", op = "rename", path = "file" },
+                new { session = "s", site = "s", op = "rename", from = "file" }, new { session = "s", site = "s", op = "rename", to = "file" },
+                new { session = "s", site = "s", op = "rename", from = "a", to = "b", path = "c" },
+                new { session = "s", site = "s", op = "delete", from = "a", to = "b" }, new { session = "s", site = "s", op = "mkdir" },
+                new { session = "s", site = "s", op = "delete", path = "a", to = "b" }, new { session = "s", site = "s", op = "mkdir", path = "" }
             ];
             foreach (object args in invalid)
             {
@@ -165,14 +265,14 @@ internal static class Tests
         {
             (string Name, string Method, object Args)[] cases =
             [
-                ("transfers_download", "transfers.download", new { session = "s", path = "assets/file", local_path = "copies/file" }),
-                ("transfers_download", "transfers.download", new { session = "s", path = "assets/file" }),
-                ("transfers_upload", "transfers.upload", new { session = "s", path = "assets/file..txt" }),
-                ("sessions_cwd", "sessions.cwd", new { session = "s", path = "/site/assets" }),
-                ("sessions_cwd", "sessions.cwd", new { session = "s", path = "assets" }),
+                ("transfers_download", "transfers.download", new { session = "s", site = "s", path = "assets/file", local_path = "copies/file" }),
+                ("transfers_download", "transfers.download", new { session = "s", site = "s", path = "assets/file" }),
+                ("transfers_upload", "transfers.upload", new { session = "s", site = "s", path = "assets/file..txt" }),
+                ("sessions_cwd", "sessions.cwd", new { session = "s", site = "s", path = "/site/assets" }),
+                ("sessions_cwd", "sessions.cwd", new { session = "s", site = "s", path = "assets" }),
                 ("jobs_status", "jobs.status", new { job = "job-1" }),
-                ("fs_prepare", "fs.prepare", new { session = "s", op = "rename", from = "assets/old", to = "assets/new" }),
-                ("fs_prepare", "fs.prepare", new { session = "s", op = "delete", path = "assets/old" })
+                ("fs_prepare", "fs.prepare", new { session = "s", site = "s", op = "rename", from = "assets/old", to = "assets/new" }),
+                ("fs_prepare", "fs.prepare", new { session = "s", site = "s", op = "delete", path = "assets/old" })
             ];
             foreach (var item in cases)
             {
@@ -193,17 +293,17 @@ internal static class Tests
             {
                 foreach (string field in new[] { "local_file", "remote_name", "remote_file", "local_name" })
                 {
-                    var args = new Dictionary<string, object> { ["session"] = "s", ["path"] = "assets/file", [field] = "legacy" };
+                    var args = new Dictionary<string, object> { ["session"] = "s", ["site"] = "s", ["path"] = "assets/file", [field] = "legacy" };
                     var mcp = await Run(["mcp"], NoServer(), Initialize() + Ready + Request(2, "tools/call", new { name = $"transfers_{command}", arguments = args }));
                     Equal(-32602, Code(ParseFrames(mcp.Output)[1]));
-                    var cli = await Run([command, "--session", "s", "--path", "assets/file", "--" + field.Replace('_', '-'), "legacy"], NoServer());
+                    var cli = await Run([command, "--session", "s", "--site", "s", "--path", "assets/file", "--" + field.Replace('_', '-'), "legacy"], NoServer());
                     Equal(1, cli.Code);
                     Equal("", cli.Output);
                     Check(!cli.Error.Contains("No verified"), "legacy CLI must fail before discovery");
                 }
             }
             var upload = await Run(["mcp"], NoServer(), Initialize() + Ready + Request(2, "tools/call",
-                new { name = "transfers_upload", arguments = new { session = "s", path = "file", local_path = "copy" } }));
+                new { name = "transfers_upload", arguments = new { session = "s", site = "s", path = "file", local_path = "copy" } }));
             Equal(-32602, Code(ParseFrames(upload.Output)[1]));
         });
         await Test("Mirror path schemas match relative POSIX validation", () =>
@@ -226,7 +326,7 @@ internal static class Tests
                     Equal(tool.Method == "sessions.cwd", System.Text.RegularExpressions.Regex.IsMatch("/", pattern));
                 }
                 if (tool.Method is "transfers.upload" or "transfers.download")
-                    Equal("session,path", string.Join(',', schema.GetProperty("required").EnumerateArray().Select(p => p.GetString())));
+                    Equal("session,site,path", string.Join(',', schema.GetProperty("required").EnumerateArray().Select(p => p.GetString())));
             }
             return Task.CompletedTask;
         });
@@ -234,14 +334,14 @@ internal static class Tests
         {
             (string Tool, string Field, object Args)[] cases =
             [
-                ("transfers_upload", "path", new { session = "s", path = "file" }),
-                ("transfers_download", "path", new { session = "s", path = "file" }),
-                ("transfers_download", "local_path", new { session = "s", path = "file", local_path = "copy" }),
-                ("fs_prepare", "path", new { session = "s", op = "mkdir", path = "dir" }),
-                ("fs_prepare", "path", new { session = "s", op = "delete", path = "file" }),
-                ("fs_prepare", "from", new { session = "s", op = "rename", from = "old", to = "new" }),
-                ("fs_prepare", "to", new { session = "s", op = "rename", from = "old", to = "new" }),
-                ("sessions_cwd", "path", new { session = "s", path = "assets" })
+                ("transfers_upload", "path", new { session = "s", site = "s", path = "file" }),
+                ("transfers_download", "path", new { session = "s", site = "s", path = "file" }),
+                ("transfers_download", "local_path", new { session = "s", site = "s", path = "file", local_path = "copy" }),
+                ("fs_prepare", "path", new { session = "s", site = "s", op = "mkdir", path = "dir" }),
+                ("fs_prepare", "path", new { session = "s", site = "s", op = "delete", path = "file" }),
+                ("fs_prepare", "from", new { session = "s", site = "s", op = "rename", from = "old", to = "new" }),
+                ("fs_prepare", "to", new { session = "s", site = "s", op = "rename", from = "old", to = "new" }),
+                ("sessions_cwd", "path", new { session = "s", site = "s", path = "assets" })
             ];
             foreach (var item in cases)
             {
@@ -255,11 +355,11 @@ internal static class Tests
                 }
             }
         });
-        await Test("M2 M3 native authorization and expiry errors surface as tool errors", async () =>
+        await Test("M2 M3 native site mismatch and expiry errors surface as tool errors", async () =>
         {
-            foreach (int code in new[] { -32003, -32006 })
+            foreach (int code in new[] { -32004, -32006 })
             {
-                await using var mock = new MockPipe(_ => JsonSerializer.Serialize(new { jsonrpc = "2.0", id = 1, error = new { code, message = code == -32003 ? "Not armed" : "Plan expired" } }) + "\n");
+                await using var mock = new MockPipe(_ => JsonSerializer.Serialize(new { jsonrpc = "2.0", id = 1, error = new { code, message = code == -32004 ? "Site mismatch" : "Plan expired" } }) + "\n");
                 var result = await Run(["mcp", "--pid", Pid.ToString()], mock.Client(), Initialize() + Ready + Request(2, "tools/call", new { name = "fs_commit", arguments = new { plan_id = "plan" } }));
                 var frame = ParseFrames(result.Output)[1];
                 Check(frame.GetProperty("result").GetProperty("isError").GetBoolean(), "native rejection is tool error");
@@ -269,7 +369,7 @@ internal static class Tests
         });
         await Test("M2 M3 oversized MCP frames are rejected without executing tools", async () =>
         {
-            string input = Initialize() + Ready + Request(2, "tools/call", new { name = "fs_prepare", arguments = new { session = "s", op = "mkdir", path = new string('a', Json.MaxRequest) } }) + Request(3, "ping");
+            string input = Initialize() + Ready + Request(2, "tools/call", new { name = "fs_prepare", arguments = new { session = "s", site = "s", op = "mkdir", path = new string('a', Json.MaxRequest) } }) + Request(3, "ping");
             var frames = ParseFrames((await Run(["mcp"], NoServer(), input)).Output);
             Equal(-32700, Code(frames[1]));
             Equal(3, frames[2].GetProperty("id").GetInt32());
@@ -615,10 +715,10 @@ internal static class Tests
     private static JsonElement ValidArgs(string method) => Json.Element(method switch
     {
         "sessions.files" or "sessions.refresh" => (object)new { session = "session-1" },
-        "sessions.cwd" => new { session = "session-1", path = "/pub" },
-        "transfers.download" => new { session = "session-1", path = "assets/source.txt" },
-        "transfers.upload" => new { session = "session-1", path = "assets/source.txt" },
-        "fs.prepare" => new { session = "session-1", op = "mkdir", path = "new-directory" },
+        "sessions.cwd" => new { session = "session-1", site = "Example Site", path = "/pub" },
+        "transfers.download" => new { session = "session-1", site = "Example Site", path = "assets/source.txt" },
+        "transfers.upload" => new { session = "session-1", site = "Example Site", path = "assets/source.txt" },
+        "fs.prepare" => new { session = "session-1", site = "Example Site", op = "mkdir", path = "new-directory" },
         "fs.commit" => new { plan_id = "plan-1" },
         _ => new { }
     });

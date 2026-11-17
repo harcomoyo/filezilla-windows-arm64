@@ -1,0 +1,1451 @@
+diff --git a/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
+index 4a807fc..c702e60 100644
+--- a/src/interface/Mainfrm.cpp
++++ b/src/interface/Mainfrm.cpp
+@@ -843,10 +843,29 @@ void CMainFrame::OnMenuHandler(wxCommandEvent &event)
+ 			bool const enabled = options_.get_int(OPTION_LOCAL_API_ENABLED) == 0;
+ 			options_.set(OPTION_LOCAL_API_ENABLED, enabled ? 1 : 0);
+ 			m_pMenuBar->Check(XRCID("ID_MENU_API_ENABLE"), enabled);
++			m_pMenuBar->Enable(XRCID("ID_MENU_API_ALLOW_CHANGES"), enabled);
+ 			if (enabled) local_api_->Start();
+ 			else local_api_->Stop();
+ 		}
+ 	}
++	else if (id == XRCID("ID_MENU_API_ALLOW_CHANGES")) {
++		if (local_api_) {
++			if (event.IsChecked()) {
++				if (!local_api_->ArmMutations()) {
++					m_pMenuBar->Check(XRCID("ID_MENU_API_ALLOW_CHANGES"), false);
++					if (options_.get_int(OPTION_LOCAL_API_ENABLED)) {
++						wxMessageBoxEx(_("The local API is not running."), _("Local API"), wxOK | wxICON_INFORMATION, this);
++					}
++					else {
++						wxMessageBoxEx(_("Enable the local API before allowing file changes."), _("Local API"), wxOK | wxICON_INFORMATION, this);
++					}
++				}
++			}
++			else {
++				local_api_->DisarmMutations();
++			}
++		}
++	}
+ 	else if (id == XRCID("ID_MENU_API_STATUS")) {
+ 		if (local_api_) {
+ 			wxMessageBoxEx(local_api_->Status(), _("Local API status"), wxOK | wxICON_INFORMATION, this);
+diff --git a/src/interface/Makefile.am b/src/interface/Makefile.am
+index c133679..b03cf7b 100644
+--- a/src/interface/Makefile.am
++++ b/src/interface/Makefile.am
+@@ -144,6 +144,7 @@ filezilla_SOURCES = \
+ 
+ noinst_HEADERS = \
+ 		aboutdialog.h \
++		api_hooks.h \
+ 		asksavepassworddialog.h \
+ 		asyncrequestqueue.h \
+ 		aui_notebook_ex.h \
+diff --git a/src/interface/api_hooks.h b/src/interface/api_hooks.h
+new file mode 100644
+index 0000000..81fa2a2
+--- /dev/null
++++ b/src/interface/api_hooks.h
+@@ -0,0 +1,15 @@
++#ifndef FILEZILLA_INTERFACE_API_HOOKS_HEADER
++#define FILEZILLA_INTERFACE_API_HOOKS_HEADER
++
++#ifdef __WXMSW__
++
++#include <string>
++
++class CServerPath;
++
++// Returns true if a file-exists notification belongs to a recently queued API
++// transfer. Matching does not remove the registry entry, so retries are covered.
++bool ApiConsumeAutoOverwrite(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile);
++
++#endif
++#endif
+diff --git a/src/interface/asyncrequestqueue.cpp b/src/interface/asyncrequestqueue.cpp
+index 92da0f7..7c29863 100644
+--- a/src/interface/asyncrequestqueue.cpp
++++ b/src/interface/asyncrequestqueue.cpp
+@@ -10,6 +10,9 @@
+ #include "verifycertdialog.h"
+ #include "verifyhostkeydialog.h"
+ #include "../commonui/hostkey_store.h"
++#ifdef __WXMSW__
++#include "api_hooks.h"
++#endif
+ 
+ #include <libfilezilla/translate.hpp>
+ 
+@@ -48,6 +51,12 @@ bool CAsyncRequestQueue::ProcessDefaults(CFileZillaEngine *pEngine, std::unique_
+ 		{
+ 			CFileExistsNotification *pFileExistsNotification = static_cast<CFileExistsNotification *>(pNotification.get());
+ 
++#ifdef __WXMSW__
++			if (ApiConsumeAutoOverwrite(pFileExistsNotification->download, pFileExistsNotification->localFile, pFileExistsNotification->remotePath, pFileExistsNotification->remoteFile)) {
++				pFileExistsNotification->overwriteAction = CFileExistsNotification::overwrite;
++			}
++#endif
++
+ 			// Get the action, go up the hierarchy till one is found
+ 			CFileExistsNotification::OverwriteAction action = pFileExistsNotification->overwriteAction;
+ 			if (action == CFileExistsNotification::unknown) {
+diff --git a/src/interface/local_api.cpp b/src/interface/local_api.cpp
+index 507b04c..f8e5425 100644
+--- a/src/interface/local_api.cpp
++++ b/src/interface/local_api.cpp
+@@ -3,17 +3,28 @@
+ 
+ #ifdef __WXMSW__
+ #include "Mainfrm.h"
++#include "api_hooks.h"
++#include "Options.h"
+ #include "QueueView.h"
+ #include "context_control.h"
++#include "../include/commands.h"
+ #include "../include/directorylisting.h"
+ #include <sddl.h>
++#include <wx/filename.h>
++#include <wx/menu.h>
++#include <wx/xrc/xmlres.h>
+ #include <algorithm>
++#include <ctime>
++#include <cwchar>
++#include <cwctype>
+ #include <set>
++#include <vector>
+ 
+ namespace {
+ constexpr size_t max_request = 64 * 1024;
+ constexpr size_t max_response = 1024 * 1024;
+ constexpr DWORD timeout_ms = 5000;
++constexpr uint64_t max_transfer_size = 100ull * 1024 * 1024;
+ 
+ bool Members(fz::json const& value, std::initializer_list<char const*> allowed)
+ {
+@@ -86,6 +97,602 @@ bool Integer(fz::json const& value, int64_t& result)
+ 	result = *number;
+ 	return true;
+ }
++
++fz::json Reply(fz::json const& id, fz::json result)
++{
++	fz::json reply;
++	reply["jsonrpc"] = "2.0";
++	reply["id"] = id ? id : fz::json(fz::json_type::null);
++	reply["result"] = std::move(result);
++	return reply;
++}
++
++std::wstring EnvValue(wchar_t const* name)
++{
++	DWORD length = GetEnvironmentVariableW(name, nullptr, 0);
++	if (!length) {
++		return {};
++	}
++	std::vector<wchar_t> buffer(length);
++	if (!GetEnvironmentVariableW(name, buffer.data(), length)) {
++		return {};
++	}
++	return std::wstring(buffer.data());
++}
++
++std::string ToUtf8(std::wstring const& text)
++{
++	if (text.empty()) {
++		return {};
++	}
++	int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
++	if (size <= 0) {
++		return {};
++	}
++	std::string result(size, '\0');
++	WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
++	return result;
++}
++
++std::wstring FromUtf8(std::string const& text)
++{
++	if (text.empty()) {
++		return {};
++	}
++	int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
++	if (size <= 0) {
++		return {};
++	}
++	std::wstring result(size, L'\0');
++	MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), result.data(), size);
++	return result;
++}
++
++std::string IsoUtc(std::time_t when)
++{
++	std::tm* tm = std::gmtime(&when);
++	if (!tm) {
++		return {};
++	}
++	char buffer[32];
++	if (!std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", tm)) {
++		return {};
++	}
++	return buffer;
++}
++
++bool ReadUtf8File(std::wstring const& path, std::string& text)
++{
++	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++		nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++	if (file == INVALID_HANDLE_VALUE) {
++		return false;
++	}
++	LARGE_INTEGER size{};
++	bool ok = GetFileSizeEx(file, &size) != FALSE && size.QuadPart >= 0 && size.QuadPart <= 64 * 1024;
++	if (ok) {
++		text.resize(static_cast<size_t>(size.QuadPart));
++		size_t offset{};
++		while (offset < text.size()) {
++			DWORD count{};
++			if (!ReadFile(file, text.data() + offset, static_cast<DWORD>(text.size() - offset), &count, nullptr) || !count) {
++				ok = false;
++				break;
++			}
++			offset += count;
++		}
++	}
++	CloseHandle(file);
++	if (!ok) {
++		return false;
++	}
++	if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xef && static_cast<unsigned char>(text[1]) == 0xbb && static_cast<unsigned char>(text[2]) == 0xbf) {
++		text.erase(0, 3);
++	}
++	return true;
++}
++
++bool HasControlChars(std::wstring const& text)
++{
++	for (wchar_t c : text) {
++		if (c < 0x20 || c == 0x7f) {
++			return true;
++		}
++	}
++	return false;
++}
++
++bool HasParentSegment(std::wstring const& text)
++{
++	size_t start{};
++	while (start <= text.size()) {
++		auto pos = text.find_first_of(L"/\\", start);
++		auto segment = text.substr(start, pos == std::wstring::npos ? std::wstring::npos : pos - start);
++		if (segment == L"..") {
++			return true;
++		}
++		if (pos == std::wstring::npos) {
++			break;
++		}
++		start = pos + 1;
++	}
++	return false;
++}
++
++bool IsAbsoluteRemote(std::wstring const& text)
++{
++	if (text.empty()) {
++		return false;
++	}
++	if (text[0] == L'/' || text[0] == L'\\' || text[0] == L'[') {
++		return true;
++	}
++	return text.size() >= 3 && std::iswalpha(text[0]) && text[1] == L':' && (text[2] == L'/' || text[2] == L'\\');
++}
++
++bool HasTrailingSeparator(std::wstring const& text)
++{
++	return !text.empty() && (text.back() == L'/' || text.back() == L'\\');
++}
++
++bool BareRemoteName(std::wstring const& name)
++{
++	if (name.empty() || name == L"." || name == L".." || HasControlChars(name)) {
++		return false;
++	}
++	return name.find_first_of(L"/\\") == std::wstring::npos;
++}
++
++bool EqualNoCase(std::wstring const& left, std::wstring const& right)
++{
++	if (left.size() != right.size()) {
++		return false;
++	}
++	for (size_t i{}; i < left.size(); ++i) {
++		if (std::towlower(left[i]) != std::towlower(right[i])) {
++			return false;
++		}
++	}
++	return true;
++}
++
++bool BareLocalName(std::wstring const& name)
++{
++	if (!BareRemoteName(name) || name.back() == L' ' || name.back() == L'.') {
++		return false;
++	}
++	if (name.find_first_of(L"<>:\"|?*") != std::wstring::npos) {
++		return false;
++	}
++	auto dot = name.find(L'.');
++	auto base = name.substr(0, dot);
++	for (auto const* reserved : {L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9", L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"}) {
++		if (EqualNoCase(base, reserved)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++bool IsAbsoluteLocal(std::wstring const& text)
++{
++	if (text.size() >= 2 && text[0] == L'\\' && text[1] == L'\\') {
++		return true;
++	}
++	return text.size() >= 3 && std::iswalpha(text[0]) && text[1] == L':' && (text[2] == L'/' || text[2] == L'\\');
++}
++
++bool RelativePath(std::wstring const& text, bool allowEmpty)
++{
++	if (text.empty()) {
++		return allowEmpty;
++	}
++	if (HasControlChars(text) || text[0] == L'/' || text.find(L'\\') != std::wstring::npos) {
++		return false;
++	}
++	if (text.size() >= 2 && std::iswalpha(text[0]) && text[1] == L':') {
++		return false;
++	}
++	size_t start{};
++	while (true) {
++		auto pos = text.find(L'/', start);
++		auto segment = text.substr(start, pos == std::wstring::npos ? std::wstring::npos : pos - start);
++		if (segment.empty() || segment == L"." || segment == L"..") {
++			return false;
++		}
++		if (pos == std::wstring::npos) {
++			break;
++		}
++		start = pos + 1;
++	}
++	return true;
++}
++
++bool LocalRelativePath(std::wstring const& text, bool allowEmpty)
++{
++	if (!RelativePath(text, allowEmpty)) {
++		return false;
++	}
++	size_t start{};
++	while (start < text.size()) {
++		auto pos = text.find(L'/', start);
++		auto segment = text.substr(start, pos == std::wstring::npos ? std::wstring::npos : pos - start);
++		if (!BareLocalName(segment)) {
++			return false;
++		}
++		if (pos == std::wstring::npos) {
++			break;
++		}
++		start = pos + 1;
++	}
++	return true;
++}
++
++std::wstring TrimLocalRoot(std::wstring path)
++{
++	while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/')) {
++		path.pop_back();
++	}
++	return path;
++}
++
++bool ParseRemotePath(std::wstring const& text, ServerType type, CServerPath& path)
++{
++	if (text.size() > 4096 || HasControlChars(text) || HasParentSegment(text) || !IsAbsoluteRemote(text)) {
++		return false;
++	}
++	CServerPath parsed(text, type);
++	if (!parsed) {
++		return false;
++	}
++	path = std::move(parsed);
++	return true;
++}
++
++std::wstring CanonicalLocal(std::wstring const& path)
++{
++	DWORD size = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
++	if (!size) {
++		return {};
++	}
++	std::vector<wchar_t> buffer(size + 1);
++	DWORD written = GetFullPathNameW(path.c_str(), size + 1, buffer.data(), nullptr);
++	if (!written || written >= buffer.size()) {
++		return {};
++	}
++	return std::wstring(buffer.data(), written);
++}
++
++bool IsLocalInside(std::wstring child, std::wstring parent)
++{
++	for (auto& c : child) {
++		if (c == L'/') c = L'\\';
++	}
++	for (auto& c : parent) {
++		if (c == L'/') c = L'\\';
++	}
++	while (child.size() > 3 && child.back() == L'\\') child.pop_back();
++	while (parent.size() > 3 && parent.back() == L'\\') parent.pop_back();
++	if (parent.empty() || child.size() < parent.size()) {
++		return false;
++	}
++	for (size_t i{}; i < parent.size(); ++i) {
++		if (std::towlower(child[i]) != std::towlower(parent[i])) {
++			return false;
++		}
++	}
++	return child.size() == parent.size() || parent.back() == L'\\' || child[parent.size()] == L'\\';
++}
++
++// Checks one path component without following a reparse point. Returns false when
++// the component does not exist, so callers can stop at the nearest existing
++// ancestor. An entry that exists but cannot be inspected is treated as unsafe.
++bool ReparsePointAt(std::wstring const& path, bool& reparse)
++{
++	reparse = false;
++	HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
++		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
++		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
++	if (handle != INVALID_HANDLE_VALUE) {
++		FILE_ATTRIBUTE_TAG_INFO info{};
++		bool const inspected = GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &info, sizeof(info)) != FALSE;
++		CloseHandle(handle);
++		if (inspected) {
++			reparse = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
++			return true;
++		}
++	}
++	else {
++		DWORD const error = GetLastError();
++		if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
++			return false;
++		}
++	}
++	DWORD const attributes = GetFileAttributesW(path.c_str());
++	if (attributes == INVALID_FILE_ATTRIBUTES) {
++		DWORD const error = GetLastError();
++		if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
++			return false;
++		}
++		reparse = true;
++		return true;
++	}
++	reparse = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
++	return true;
++}
++
++// Walks every path component below root without following reparse points, stopping
++// at the nearest existing ancestor. Returns true when a component in that chain is
++// a reparse point or when the path cannot be validated.
++bool LocalChainHasReparsePoint(std::wstring const& path, std::wstring const& root)
++{
++	std::wstring resolved = CanonicalLocal(path);
++	std::wstring canonicalRoot = CanonicalLocal(root);
++	if (resolved.empty() || canonicalRoot.empty() || !IsLocalInside(resolved, canonicalRoot)) {
++		return true;
++	}
++	for (auto& c : resolved) {
++		if (c == L'/') c = L'\\';
++	}
++	for (auto& c : canonicalRoot) {
++		if (c == L'/') c = L'\\';
++	}
++	while (resolved.size() > 3 && resolved.back() == L'\\') resolved.pop_back();
++	while (canonicalRoot.size() > 3 && canonicalRoot.back() == L'\\') canonicalRoot.pop_back();
++	size_t offset = canonicalRoot.size();
++	if (offset < resolved.size() && resolved[offset] == L'\\') {
++		++offset;
++	}
++	while (offset < resolved.size()) {
++		auto separator = resolved.find(L'\\', offset);
++		auto end = separator == std::wstring::npos ? resolved.size() : separator;
++		bool reparse{};
++		if (!ReparsePointAt(resolved.substr(0, end), reparse) || reparse) {
++			return reparse;
++		}
++		if (separator == std::wstring::npos) {
++			break;
++		}
++		offset = separator + 1;
++	}
++	return false;
++}
++
++bool LocalFileInfo(std::wstring const& path, bool& directory, uint64_t& size)
++{
++	WIN32_FILE_ATTRIBUTE_DATA data{};
++	if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
++		return false;
++	}
++	directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
++	size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
++	return true;
++}
++
++bool EnsureLocalDir(std::wstring const& path, std::wstring const& root, bool& reparse)
++{
++	reparse = false;
++	wxFileName::Mkdir(path, 0777, wxPATH_MKDIR_FULL);
++	DWORD attributes = GetFileAttributesW(path.c_str());
++	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
++		return false;
++	}
++	reparse = LocalChainHasReparsePoint(path, root);
++	return !reparse;
++}
++
++bool RemotePathFor(CServerPath const& root, std::wstring const& relative, bool allowEmpty, CServerPath& path)
++{
++	if (!RelativePath(relative, allowEmpty)) {
++		return false;
++	}
++	CServerPath joined = root;
++	if (!relative.empty() && !joined.ChangePath(relative)) {
++		return false;
++	}
++	if (!joined || !joined.IsSubdirOf(root, false, true)) {
++		return false;
++	}
++	path = std::move(joined);
++	return true;
++}
++
++bool LocalPathFor(std::wstring const& root, std::wstring const& relative, bool allowEmpty, std::wstring& path)
++{
++	if (!RelativePath(relative, allowEmpty)) {
++		return false;
++	}
++	std::wstring joined = root;
++	if (!relative.empty()) {
++		if (joined.empty() || joined.back() != L'\\') {
++			joined += L'\\';
++		}
++		for (wchar_t c : relative) {
++			joined += (c == L'/' ? L'\\' : c);
++		}
++	}
++	auto canonical = CanonicalLocal(joined);
++	if (canonical.empty() || !IsLocalInside(canonical, root)) {
++		return false;
++	}
++	path = std::move(canonical);
++	return true;
++}
++
++struct Roots
++{
++	CServerPath remote;
++	std::wstring local;
++};
++
++bool SiteRoots(Site const& site, Roots& roots)
++{
++	auto name = site.GetName();
++	if (name.empty()) {
++		return false;
++	}
++	auto appdata = EnvValue(L"APPDATA");
++	std::string text;
++	if (appdata.empty() || !ReadUtf8File(appdata + L"\\FileZilla\\api-roots.json", text)) {
++		return false;
++	}
++	auto document = fz::json::parse(text);
++	if (!document || !document.is_object()) {
++		return false;
++	}
++	auto const& rootsJson = document;
++	auto find = [&rootsJson](std::string const& key, fz::json& entry) {
++		entry = rootsJson[key];
++		return entry && entry.type() != fz::json_type::none;
++	};
++	fz::json entry;
++	bool found = find(ToUtf8(name), entry);
++	if (!found && name.size() > 4 && name.compare(name.size() - 4, 4, L".xml") == 0) {
++		found = find(ToUtf8(name.substr(0, name.size() - 4)), entry);
++	}
++	if (!found || !entry.is_object()) {
++		return false;
++	}
++	auto const& remoteNode = entry["remote"];
++	auto const& localNode = entry["local"];
++	if (remoteNode.type() != fz::json_type::string || localNode.type() != fz::json_type::string) {
++		return false;
++	}
++	auto remoteText = FromUtf8(remoteNode.string_value());
++	auto localText = FromUtf8(localNode.string_value());
++	if (remoteText.empty() || localText.empty() || HasControlChars(remoteText) || HasControlChars(localText) || !IsAbsoluteLocal(localText)) {
++		return false;
++	}
++	CServerPath remote;
++	if (!ParseRemotePath(remoteText, site.server.GetType(), remote)) {
++		return false;
++	}
++	auto local = TrimLocalRoot(CanonicalLocal(localText));
++	if (local.empty()) {
++		return false;
++	}
++	roots.remote = std::move(remote);
++	roots.local = std::move(local);
++	return true;
++}
++
++std::string AuditField(std::wstring const& text)
++{
++	auto result = ToUtf8(text);
++	for (auto& c : result) {
++		if (c == '\r' || c == '\n' || (static_cast<unsigned char>(c) < 0x20)) {
++			c = ' ';
++		}
++	}
++	if (result.size() > 512) {
++		result.resize(512);
++	}
++	return result;
++}
++
++void AppendAuditLine(std::string const& line)
++{
++	auto local = EnvValue(L"LOCALAPPDATA");
++	if (local.empty()) {
++		return;
++	}
++	auto directory = local + L"\\FileZilla";
++	CreateDirectoryW(directory.c_str(), nullptr);
++	auto path = directory + L"\\api-audit.log";
++	HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++		nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++	if (file == INVALID_HANDLE_VALUE) {
++		return;
++	}
++	DWORD written{};
++	WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
++	CloseHandle(file);
++}
++
++constexpr ULONGLONG auto_overwrite_ttl_ms = 180 * 1000; // 180 s
++constexpr size_t max_auto_overwrite_entries = 256;
++
++// API transfers go through the normal queue, where the file-exists default can
++// be "ask" and would open a modal dialog. Overwrite is the API default in both
++// directions: a download replaces an existing local file, an upload replaces an
++// existing remote file. Remember recent API transfers briefly so ProcessDefaults
++// can select overwrite without user interaction. The GUI thread owns this
++// registry. Entries are not consumed, so engine retries of the same transfer
++// keep working.
++struct AutoOverwriteEntry
++{
++	bool download{};
++	std::wstring localFile;
++	std::wstring remotePath;
++	std::wstring remoteFile;
++	ULONGLONG expiry{};
++	bool audited{};
++};
++
++std::vector<AutoOverwriteEntry> autoOverwriteEntries;
++
++std::wstring NormalizeLocalForMatch(std::wstring text)
++{
++	for (auto& c : text) {
++		if (c == L'/') {
++			c = L'\\';
++		}
++		c = static_cast<wchar_t>(std::towlower(c));
++	}
++	return text;
++}
++
++void PruneAutoOverwrite(ULONGLONG now)
++{
++	autoOverwriteEntries.erase(std::remove_if(autoOverwriteEntries.begin(), autoOverwriteEntries.end(),
++		[now](AutoOverwriteEntry const& entry) { return now >= entry.expiry; }), autoOverwriteEntries.end());
++}
++
++void RegisterAutoOverwrite(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile)
++{
++	auto const now = GetTickCount64();
++	PruneAutoOverwrite(now);
++	AutoOverwriteEntry entry;
++	entry.download = download;
++	entry.localFile = NormalizeLocalForMatch(localFile);
++	entry.remotePath = remotePath.GetPath();
++	entry.remoteFile = remoteFile;
++	entry.expiry = now + auto_overwrite_ttl_ms;
++	autoOverwriteEntries.push_back(std::move(entry));
++	while (autoOverwriteEntries.size() > max_auto_overwrite_entries) {
++		autoOverwriteEntries.erase(autoOverwriteEntries.begin());
++	}
++}
++}
++
++// The name is part of the hook contract. Matching deliberately does not remove
++// the entry, so retries of the same transfer are also auto-overwritten.
++bool ApiConsumeAutoOverwrite(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile)
++{
++	auto const now = GetTickCount64();
++	PruneAutoOverwrite(now);
++	auto const local = NormalizeLocalForMatch(localFile);
++	auto const remote = remotePath.GetPath();
++	for (auto& entry : autoOverwriteEntries) {
++		if (entry.download != download || entry.remotePath != remote || entry.remoteFile != remoteFile) {
++			continue;
++		}
++		if (entry.localFile != local) {
++			continue;
++		}
++		if (!entry.audited) {
++			entry.audited = true;
++			auto line = IsoUtc(std::time(nullptr));
++			line += " method=auto-overwrite";
++			line += (download ? " download=true" : " download=false");
++			line += " remote_file=" + AuditField(remoteFile);
++			line += " local_file=" + AuditField(localFile);
++			line += "\n";
++			AppendAuditLine(line);
++		}
++		return true;
++	}
++	return false;
+ }
+ 
+ LocalApi::LocalApi(CMainFrame& frame)
+@@ -128,6 +735,55 @@ std::string LocalApi::Id(CState* state)
+ 	return id;
+ }
+ 
++CState* LocalApi::Session(std::string const& id)
++{
++	for (auto* state : *CContextManager::Get()->GetAllStates()) {
++		if (IsSession(state) && Id(state) == id) {
++			return state;
++		}
++	}
++	return nullptr;
++}
++
++bool LocalApi::MutationsArmed()
++{
++	if (armed_until_ && GetTickCount64() >= armed_until_) {
++		armed_until_ = 0;
++		plans_.clear();
++	}
++	return armed_until_ != 0;
++}
++
++bool LocalApi::ArmMutations()
++{
++	if (pipe_ == INVALID_HANDLE_VALUE || !timer_.IsRunning() || frame_.GetOptions().get_int(OPTION_LOCAL_API_ENABLED) == 0) {
++		return false;
++	}
++	armed_until_ = GetTickCount64() + 600000;
++	return true;
++}
++
++void LocalApi::DisarmMutations()
++{
++	armed_until_ = 0;
++	plans_.clear();
++	if (auto* menuBar = frame_.GetMenuBar()) {
++		menuBar->Check(XRCID("ID_MENU_API_ALLOW_CHANGES"), false);
++	}
++}
++
++void LocalApi::Audit(std::string const& method, std::wstring const& site, std::vector<std::wstring> const& paths, std::string const& result)
++{
++	auto line = IsoUtc(std::time(nullptr));
++	line += " method=" + method;
++	line += " site=" + AuditField(site);
++	for (auto const& path : paths) {
++		line += " path=" + AuditField(path);
++	}
++	line += " result=" + result + "\n";
++	AppendAuditLine(line);
++}
++
+ wxString LocalApi::Status()
+ {
+ 	std::lock_guard<std::mutex> lock(mutex_);
+@@ -206,6 +862,7 @@ void LocalApi::Start()
+ void LocalApi::Stop()
+ {
+ 	timer_.Stop();
++	DisarmMutations();
+ 	if (stop_) SetEvent(stop_);
+ 	if (worker_.joinable()) worker_.join();
+ 	if (pipe_ != INVALID_HANDLE_VALUE) CloseHandle(pipe_);
+@@ -331,6 +988,9 @@ std::string LocalApi::Exchange(std::string const& line)
+ 
+ void LocalApi::Tick(wxTimerEvent&)
+ {
++	if (auto* menuBar = frame_.GetMenuBar()) {
++		menuBar->Check(XRCID("ID_MENU_API_ALLOW_CHANGES"), MutationsArmed());
++	}
+ 	std::lock_guard<std::mutex> lock(mutex_);
+ 	if (!pending_) return;
+ 	auto request = fz::json::parse(request_);
+@@ -359,7 +1019,13 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 		return ErrorResponse(id, -32602, "Method takes no params");
+ 	}
+ 	if ((method == "sessions.refresh" && !Members(params, {"session"})) ||
+-		(method == "sessions.files" && !Members(params, {"session", "offset", "limit"}))) {
++		(method == "sessions.files" && !Members(params, {"session", "offset", "limit"})) ||
++		(method == "sessions.cwd" && !Members(params, {"session", "path"})) ||
++		(method == "transfers.download" && !Members(params, {"session", "path", "local_path"})) ||
++		(method == "transfers.upload" && !Members(params, {"session", "path"})) ||
++		(method == "jobs.status" && !Members(params, {"job"})) ||
++		(method == "fs.prepare" && !Members(params, {"session", "op", "path", "from", "to"})) ||
++		(method == "fs.commit" && !Members(params, {"plan_id"}))) {
+ 		return ErrorResponse(id, -32602, "Unknown params member");
+ 	}
+ 	fz::json result;
+@@ -448,6 +1114,12 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 			if (end < total) result["next_offset"] = end;
+ 		}
+ 	}
++	else if (method == "sessions.cwd") return Cwd(id, params);
++	else if (method == "transfers.download") return Download(id, params);
++	else if (method == "transfers.upload") return Upload(id, params);
++	else if (method == "jobs.status") return JobStatus(id, params);
++	else if (method == "fs.prepare") return Prepare(id, params);
++	else if (method == "fs.commit") return Commit(id, params);
+ 	else return ErrorResponse(id, -32601, "Method not found");
+ 	fz::json reply;
+ 	reply["jsonrpc"] = "2.0";
+@@ -455,4 +1127,529 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 	reply["result"] = std::move(result);
+ 	return reply;
+ }
++
++fz::json LocalApi::Cwd(fz::json const& id, fz::json const& params)
++{
++	auto const& session = params["session"];
++	if (session.type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
++	auto* state = Session(session.string_value());
++	if (!state) return ErrorResponse(id, -32602, "Unknown session");
++	auto const& site = state->GetSite();
++	if (!state->IsRemoteConnected() || !state->IsRemoteIdle(true)) {
++		Audit("sessions.cwd", site.GetName(), {}, "error -32007");
++		return ErrorResponse(id, -32007, "Session not connected or busy");
++	}
++	if (state->GetSyncBrowse()) {
++		Audit("sessions.cwd", site.GetName(), {}, "error -32001");
++		return ErrorResponse(id, -32001, "Disable synchronized browsing before API directory changes");
++	}
++	Roots roots;
++	if (!SiteRoots(site, roots)) {
++		Audit("sessions.cwd", site.GetName(), {}, "error -32004");
++		return ErrorResponse(id, -32004, "Site has no API roots");
++	}
++	if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
++	std::wstring requested = FromUtf8(params["path"].string_value());
++	CServerPath target;
++	if (IsAbsoluteRemote(requested)) {
++		if (!ParseRemotePath(requested, site.server.GetType(), target)) {
++			Audit("sessions.cwd", site.GetName(), {requested}, "error -32005");
++			return ErrorResponse(id, -32005, "Invalid remote path");
++		}
++	}
++	else if (!RemotePathFor(roots.remote, requested, true, target)) {
++		Audit("sessions.cwd", site.GetName(), {requested}, "error -32005");
++		return ErrorResponse(id, -32005, "Invalid relative path");
++	}
++	if (!target.IsSubdirOf(roots.remote, false, true)) {
++		Audit("sessions.cwd", site.GetName(), {target.GetPath()}, "error -32004");
++		return ErrorResponse(id, -32004, "Path outside API root");
++	}
++	if (!state->ChangeRemoteDir(target, std::wstring(), 0, false)) {
++		Audit("sessions.cwd", site.GetName(), {target.GetPath()}, "error -32007");
++		return ErrorResponse(id, -32007, "Directory change not accepted");
++	}
++	Audit("sessions.cwd", site.GetName(), {target.GetPath()}, "accepted");
++	fz::json result;
++	result["accepted"] = true;
++	result["path"] = target.GetPath();
++	return Reply(id, std::move(result));
++}
++
++fz::json LocalApi::Download(fz::json const& id, fz::json const& params)
++{
++	auto const& session = params["session"];
++	if (session.type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
++	auto* state = Session(session.string_value());
++	if (!state) return ErrorResponse(id, -32602, "Unknown session");
++	auto const& site = state->GetSite();
++	if (!state->IsRemoteConnected() || !state->IsRemoteIdle()) {
++		Audit("transfers.download", site.GetName(), {}, "error -32007");
++		return ErrorResponse(id, -32007, "Session not connected or busy");
++	}
++	Roots roots;
++	if (!SiteRoots(site, roots)) {
++		Audit("transfers.download", site.GetName(), {}, "error -32004");
++		return ErrorResponse(id, -32004, "Site has no API roots");
++	}
++	if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
++	std::wstring relative = FromUtf8(params["path"].string_value());
++	if (!RelativePath(relative, false)) {
++		Audit("transfers.download", site.GetName(), {relative}, "error -32005");
++		return ErrorResponse(id, -32005, "path must be a relative POSIX path");
++	}
++	CServerPath remote;
++	if (!RemotePathFor(roots.remote, relative, false, remote)) {
++		Audit("transfers.download", site.GetName(), {relative}, "error -32004");
++		return ErrorResponse(id, -32004, "Remote path outside API root");
++	}
++	std::wstring remoteName = remote.GetLastSegment();
++	CServerPath remoteParent = remote.GetParent();
++	if (remoteName.empty() || !BareRemoteName(remoteName) || !remoteParent) {
++		Audit("transfers.download", site.GetName(), {relative, remote.GetPath()}, "error -32005");
++		return ErrorResponse(id, -32005, "Invalid remote file path");
++	}
++	CServerPath current = state->GetRemotePath();
++	if (!current) {
++		Audit("transfers.download", site.GetName(), {relative}, "error -32008");
++		return ErrorResponse(id, -32008, "No current remote directory");
++	}
++	if (remoteParent != current) {
++		Audit("transfers.download", site.GetName(), {relative, remote.GetPath()}, "error -32008");
++		return ErrorResponse(id, -32008, "Remote parent is not the current cached directory");
++	}
++	auto listing = state->GetRemoteDir();
++	if (!listing || listing->path != current || listing->failed()) {
++		Audit("transfers.download", site.GetName(), {relative, current.GetPath()}, "error -32008");
++		return ErrorResponse(id, -32008, "Cached listing unavailable");
++	}
++	size_t found = listing->FindFile_CmpCase(remoteName);
++	if (found == std::string::npos) {
++		Audit("transfers.download", site.GetName(), {relative, remote.GetPath()}, "error -32008");
++		return ErrorResponse(id, -32008, "Remote file not found");
++	}
++	auto const& entry = (*listing)[found];
++	if (entry.is_dir()) {
++		Audit("transfers.download", site.GetName(), {relative, remote.GetPath()}, "error -32009");
++		return ErrorResponse(id, -32009, "Directory download is not supported");
++	}
++	if (entry.size < 0) {
++		Audit("transfers.download", site.GetName(), {relative, remote.GetPath()}, "error -32007");
++		return ErrorResponse(id, -32007, "Remote size unknown; refusing transfer");
++	}
++	if (static_cast<uint64_t>(entry.size) > max_transfer_size) {
++		Audit("transfers.download", site.GetName(), {relative, remote.GetPath()}, "error -32007");
++		return ErrorResponse(id, -32007, "File exceeds 100 MiB");
++	}
++	std::wstring localRelative = relative;
++	auto const& localPathNode = params["local_path"];
++	if (localPathNode && localPathNode.type() != fz::json_type::string) return ErrorResponse(id, -32602, "local_path must be a string");
++	if (localPathNode) localRelative = FromUtf8(localPathNode.string_value());
++	if (!LocalRelativePath(localRelative, false)) {
++		Audit("transfers.download", site.GetName(), {relative, localRelative}, "error -32005");
++		return ErrorResponse(id, -32005, "local_path must be a relative POSIX path");
++	}
++	std::wstring localTarget;
++	if (!LocalPathFor(roots.local, localRelative, false, localTarget)) {
++		Audit("transfers.download", site.GetName(), {relative, localRelative}, "error -32004");
++		return ErrorResponse(id, -32004, "Local path outside API root");
++	}
++	if (LocalChainHasReparsePoint(localTarget, roots.local)) {
++		Audit("transfers.download", site.GetName(), {relative, localTarget}, "error -32005");
++		return ErrorResponse(id, -32005, "Reparse point in local path");
++	}
++	std::wstring localName;
++	CLocalPath localDir(localTarget, &localName);
++	if (!localDir || localName.empty()) {
++		Audit("transfers.download", site.GetName(), {localTarget}, "error -32005");
++		return ErrorResponse(id, -32005, "Invalid local target path");
++	}
++	bool reparse{};
++	if (!EnsureLocalDir(localDir.GetPath(), roots.local, reparse)) {
++		Audit("transfers.download", site.GetName(), {localTarget}, "error -32005");
++		return ErrorResponse(id, -32005, reparse ? "Reparse point in local path" : "Cannot create local directory");
++	}
++	auto* queue = frame_.GetQueue();
++	if (!queue) return ErrorResponse(id, -32000, "Queue unavailable");
++	RegisterAutoOverwrite(true, localTarget, remoteParent, remoteName);
++	queue->QueueFile(false, true, remoteName, localName, localDir, current, site, entry.size);
++	queue->QueueFile_Finish(true);
++	Job job;
++	job.id = "j-" + std::to_string(++next_job_);
++	job.kind = "download";
++	job.created_utc = IsoUtc(std::time(nullptr));
++	job.session = Id(state);
++	job.local_path = localTarget;
++	job.remote_path = remote.GetPath();
++	jobs_.push_back(std::move(job));
++	if (jobs_.size() > 100) jobs_.erase(jobs_.begin());
++	Audit("transfers.download", site.GetName(), {relative, remote.GetPath(), localTarget}, "accepted " + jobs_.back().id);
++	fz::json result;
++	result["job"] = jobs_.back().id;
++	result["accepted"] = true;
++	result["local_path"] = jobs_.back().local_path;
++	result["remote_path"] = jobs_.back().remote_path;
++	return Reply(id, std::move(result));
++}
++
++fz::json LocalApi::Upload(fz::json const& id, fz::json const& params)
++{
++	if (!MutationsArmed()) return ErrorResponse(id, -32003, "File changes are not armed");
++	auto const& session = params["session"];
++	if (session.type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
++	auto* state = Session(session.string_value());
++	if (!state) return ErrorResponse(id, -32602, "Unknown session");
++	auto const& site = state->GetSite();
++	if (!state->IsRemoteConnected() || !state->IsRemoteIdle()) {
++		Audit("transfers.upload", site.GetName(), {}, "error -32007");
++		return ErrorResponse(id, -32007, "Session not connected or busy");
++	}
++	Roots roots;
++	if (!SiteRoots(site, roots)) {
++		Audit("transfers.upload", site.GetName(), {}, "error -32004");
++		return ErrorResponse(id, -32004, "Site has no API roots");
++	}
++	if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
++	std::wstring relative = FromUtf8(params["path"].string_value());
++	if (!LocalRelativePath(relative, false)) {
++		Audit("transfers.upload", site.GetName(), {relative}, "error -32005");
++		return ErrorResponse(id, -32005, "path must be a relative POSIX path");
++	}
++	std::wstring localSource;
++	if (!LocalPathFor(roots.local, relative, false, localSource)) {
++		Audit("transfers.upload", site.GetName(), {relative}, "error -32004");
++		return ErrorResponse(id, -32004, "Local path outside API root");
++	}
++	if (LocalChainHasReparsePoint(localSource, roots.local)) {
++		Audit("transfers.upload", site.GetName(), {relative, localSource}, "error -32005");
++		return ErrorResponse(id, -32005, "Reparse point in local path");
++	}
++	bool directory{};
++	uint64_t size{};
++	if (!LocalFileInfo(localSource, directory, size)) {
++		Audit("transfers.upload", site.GetName(), {relative, localSource}, "error -32008");
++		return ErrorResponse(id, -32008, "Local file not found");
++	}
++	if (directory) {
++		Audit("transfers.upload", site.GetName(), {relative, localSource}, "error -32009");
++		return ErrorResponse(id, -32009, "Directory upload is not supported");
++	}
++	if (size > max_transfer_size) {
++		Audit("transfers.upload", site.GetName(), {relative, localSource}, "error -32007");
++		return ErrorResponse(id, -32007, "File exceeds 100 MiB");
++	}
++	CServerPath remote;
++	if (!RemotePathFor(roots.remote, relative, false, remote)) {
++		Audit("transfers.upload", site.GetName(), {relative}, "error -32004");
++		return ErrorResponse(id, -32004, "Remote path outside API root");
++	}
++	std::wstring remoteName = remote.GetLastSegment();
++	CServerPath remoteParent = remote.GetParent();
++	if (remoteName.empty() || !BareRemoteName(remoteName) || !remoteParent) {
++		Audit("transfers.upload", site.GetName(), {relative, remote.GetPath()}, "error -32005");
++		return ErrorResponse(id, -32005, "Invalid remote file path");
++	}
++	std::wstring localName;
++	CLocalPath localDir(localSource, &localName);
++	if (!localDir || localName.empty()) {
++		Audit("transfers.upload", site.GetName(), {localSource}, "error -32005");
++		return ErrorResponse(id, -32005, "Invalid local file path");
++	}
++	auto* queue = frame_.GetQueue();
++	if (!queue) return ErrorResponse(id, -32000, "Queue unavailable");
++	RegisterAutoOverwrite(false, localSource, remoteParent, remoteName);
++	queue->QueueFile(false, false, localName, remoteName, localDir, remoteParent, site, static_cast<int64_t>(size));
++	queue->QueueFile_Finish(true);
++	Job job;
++	job.id = "j-" + std::to_string(++next_job_);
++	job.kind = "upload";
++	job.created_utc = IsoUtc(std::time(nullptr));
++	job.session = Id(state);
++	job.local_path = localSource;
++	job.remote_path = remote.GetPath();
++	jobs_.push_back(std::move(job));
++	if (jobs_.size() > 100) jobs_.erase(jobs_.begin());
++	Audit("transfers.upload", site.GetName(), {relative, remote.GetPath(), localSource}, "accepted " + jobs_.back().id);
++	fz::json result;
++	result["job"] = jobs_.back().id;
++	result["accepted"] = true;
++	result["local_path"] = jobs_.back().local_path;
++	result["remote_path"] = jobs_.back().remote_path;
++	return Reply(id, std::move(result));
++}
++
++fz::json LocalApi::JobStatus(fz::json const& id, fz::json const& params)
++{
++	auto const& wanted = params["job"];
++	if (wanted && wanted.type() != fz::json_type::string) return ErrorResponse(id, -32602, "job must be a string");
++	std::string filter;
++	bool haveFilter{};
++	if (wanted) {
++		filter = wanted.string_value();
++		haveFilter = true;
++		bool found{};
++		for (auto const& job : jobs_) {
++			if (job.id == filter) found = true;
++		}
++		if (!found) return ErrorResponse(id, -32008, "Unknown job");
++	}
++	fz::json result;
++	result["jobs"] = fz::json(fz::json_type::array);
++	size_t index{};
++	for (auto const& job : jobs_) {
++		if (haveFilter && job.id != filter) continue;
++		auto& entry = result["jobs"][index++];
++		entry["id"] = job.id;
++		entry["kind"] = job.kind;
++		entry["created_utc"] = job.created_utc;
++	}
++	auto* queue = frame_.GetQueue();
++	if (!queue) return ErrorResponse(id, -32000, "Queue unavailable");
++	result["queue"]["active"] = queue->IsActive() != 0;
++	result["queue"]["file_count"] = queue->GetFileCount();
++	return Reply(id, std::move(result));
++}
++
++fz::json LocalApi::Prepare(fz::json const& id, fz::json const& params)
++{
++	if (!MutationsArmed()) return ErrorResponse(id, -32003, "File changes are not armed");
++	auto const& session = params["session"];
++	if (session.type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
++	auto* state = Session(session.string_value());
++	if (!state) return ErrorResponse(id, -32602, "Unknown session");
++	auto const& site = state->GetSite();
++	if (!state->IsRemoteConnected() || !state->IsRemoteIdle()) {
++		Audit("fs.prepare", site.GetName(), {}, "error -32007");
++		return ErrorResponse(id, -32007, "Session not connected or busy");
++	}
++	Roots roots;
++	if (!SiteRoots(site, roots)) {
++		Audit("fs.prepare", site.GetName(), {}, "error -32004");
++		return ErrorResponse(id, -32004, "Site has no API roots");
++	}
++	if (params["op"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "op must be a string");
++	std::string op = params["op"].string_value();
++	if (op != "mkdir" && op != "rename" && op != "delete") return ErrorResponse(id, -32009, "Unsupported operation");
++	if ((op == "rename" && !Members(params, {"session", "op", "from", "to"})) ||
++		(op != "rename" && !Members(params, {"session", "op", "path"}))) {
++		return ErrorResponse(id, -32602, "Unknown params member");
++	}
++	auto now = GetTickCount64();
++	for (auto it = plans_.begin(); it != plans_.end();) {
++		if (now >= it->second.expiry) it = plans_.erase(it);
++		else ++it;
++	}
++	CServerPath current = state->GetRemotePath();
++	auto listing = state->GetRemoteDir();
++	if (!current) {
++		Audit("fs.prepare", site.GetName(), {}, "error -32008");
++		return ErrorResponse(id, -32008, "No current remote directory");
++	}
++	if (!listing || listing->path != current || listing->failed()) {
++		Audit("fs.prepare", site.GetName(), {current.GetPath()}, "error -32008");
++		return ErrorResponse(id, -32008, "Cached listing unavailable");
++	}
++	Plan plan;
++	plan.op = op;
++	plan.session = Id(state);
++	plan.expiry = now + 60000;
++	fz::json summary;
++	std::vector<std::wstring> auditPaths;
++	if (op == "mkdir") {
++		if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
++		std::wstring relative = FromUtf8(params["path"].string_value());
++		if (!RelativePath(relative, false)) {
++			Audit("fs.prepare", site.GetName(), {relative}, "error -32005");
++			return ErrorResponse(id, -32005, "path must be a relative POSIX path");
++		}
++		CServerPath remote;
++		if (!RemotePathFor(roots.remote, relative, false, remote)) {
++			Audit("fs.prepare", site.GetName(), {relative}, "error -32004");
++			return ErrorResponse(id, -32004, "Remote path outside API root");
++		}
++		std::wstring name = remote.GetLastSegment();
++		if (name.empty() || remote.GetParent() != current) {
++			Audit("fs.prepare", site.GetName(), {relative, remote.GetPath()}, "error -32008");
++			return ErrorResponse(id, -32008, "Parent directory is not the cached current directory");
++		}
++		if (listing->FindFile_CmpCase(name) != std::string::npos) {
++			Audit("fs.prepare", site.GetName(), {relative, remote.GetPath()}, "error -32005");
++			return ErrorResponse(id, -32005, "Target already exists");
++		}
++		std::wstring local;
++		if (!LocalPathFor(roots.local, relative, false, local)) {
++			Audit("fs.prepare", site.GetName(), {relative}, "error -32004");
++			return ErrorResponse(id, -32004, "Local path outside API root");
++		}
++		plan.path = relative;
++		summary["relative"] = relative;
++		summary["remote"] = remote.GetPath();
++		summary["local"] = local;
++		auditPaths = {relative, remote.GetPath()};
++	}
++	else if (op == "rename") {
++		if (params["from"].type() != fz::json_type::string || params["to"].type() != fz::json_type::string) {
++			return ErrorResponse(id, -32602, "from and to must be strings");
++		}
++		std::wstring fromRelative = FromUtf8(params["from"].string_value());
++		std::wstring toRelative = FromUtf8(params["to"].string_value());
++		if (!RelativePath(fromRelative, false) || !RelativePath(toRelative, false)) {
++			Audit("fs.prepare", site.GetName(), {fromRelative, toRelative}, "error -32005");
++			return ErrorResponse(id, -32005, "from and to must be relative POSIX paths");
++		}
++		CServerPath from, to;
++		if (!RemotePathFor(roots.remote, fromRelative, false, from) || !RemotePathFor(roots.remote, toRelative, false, to)) {
++			Audit("fs.prepare", site.GetName(), {fromRelative, toRelative}, "error -32004");
++			return ErrorResponse(id, -32004, "Remote path outside API root");
++		}
++		std::wstring fromName = from.GetLastSegment();
++		std::wstring toName = to.GetLastSegment();
++		if (fromName.empty() || toName.empty() || from.GetParent() != to.GetParent()) {
++			Audit("fs.prepare", site.GetName(), {fromRelative, toRelative}, "error -32005");
++			return ErrorResponse(id, -32005, "Invalid rename paths");
++		}
++		if (from.GetParent() != current) {
++			Audit("fs.prepare", site.GetName(), {fromRelative, from.GetPath()}, "error -32008");
++			return ErrorResponse(id, -32008, "Parent directory is not the cached current directory");
++		}
++		if (listing->FindFile_CmpCase(fromName) == std::string::npos) {
++			Audit("fs.prepare", site.GetName(), {fromRelative, from.GetPath()}, "error -32008");
++			return ErrorResponse(id, -32008, "Source not found");
++		}
++		if (listing->FindFile_CmpCase(toName) != std::string::npos) {
++			Audit("fs.prepare", site.GetName(), {toRelative, to.GetPath()}, "error -32005");
++			return ErrorResponse(id, -32005, "Target already exists");
++		}
++		std::wstring fromLocal, toLocal;
++		if (!LocalPathFor(roots.local, fromRelative, false, fromLocal) || !LocalPathFor(roots.local, toRelative, false, toLocal)) {
++			Audit("fs.prepare", site.GetName(), {fromRelative, toRelative}, "error -32004");
++			return ErrorResponse(id, -32004, "Local path outside API root");
++		}
++		plan.from = fromRelative;
++		plan.to = toRelative;
++		summary["from_relative"] = fromRelative;
++		summary["to_relative"] = toRelative;
++		summary["from_remote"] = from.GetPath();
++		summary["to_remote"] = to.GetPath();
++		summary["from_local"] = fromLocal;
++		summary["to_local"] = toLocal;
++		auditPaths = {fromRelative, from.GetPath(), toRelative, to.GetPath()};
++	}
++	else {
++		if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
++		std::wstring relative = FromUtf8(params["path"].string_value());
++		if (!RelativePath(relative, false)) {
++			Audit("fs.prepare", site.GetName(), {relative}, "error -32005");
++			return ErrorResponse(id, -32005, "path must be a relative POSIX path");
++		}
++		CServerPath remote;
++		if (!RemotePathFor(roots.remote, relative, false, remote)) {
++			Audit("fs.prepare", site.GetName(), {relative}, "error -32004");
++			return ErrorResponse(id, -32004, "Remote path outside API root");
++		}
++		std::wstring name = remote.GetLastSegment();
++		if (name.empty() || remote.GetParent() != current) {
++			Audit("fs.prepare", site.GetName(), {relative, remote.GetPath()}, "error -32008");
++			return ErrorResponse(id, -32008, "Parent directory is not the cached current directory");
++		}
++		size_t found = listing->FindFile_CmpCase(name);
++		if (found == std::string::npos) {
++			Audit("fs.prepare", site.GetName(), {relative, remote.GetPath()}, "error -32008");
++			return ErrorResponse(id, -32008, "File not found");
++		}
++		if ((*listing)[found].is_dir()) {
++			Audit("fs.prepare", site.GetName(), {relative, remote.GetPath()}, "error -32009");
++			return ErrorResponse(id, -32009, "Directory deletion is not supported in this phase");
++		}
++		std::wstring local;
++		if (!LocalPathFor(roots.local, relative, false, local)) {
++			Audit("fs.prepare", site.GetName(), {relative}, "error -32004");
++			return ErrorResponse(id, -32004, "Local path outside API root");
++		}
++		plan.path = relative;
++		summary["relative"] = relative;
++		summary["remote"] = remote.GetPath();
++		summary["local"] = local;
++		auditPaths = {relative, remote.GetPath()};
++	}
++	auto planId = "p-" + std::to_string(++next_plan_);
++	plans_[planId] = std::move(plan);
++	Audit("fs.prepare", site.GetName(), auditPaths, "prepared");
++	fz::json result;
++	result["plan_id"] = planId;
++	result["op"] = op;
++	result["summary"] = std::move(summary);
++	result["expires_at"] = IsoUtc(std::time(nullptr) + 60);
++	return Reply(id, std::move(result));
++}
++
++fz::json LocalApi::Commit(fz::json const& id, fz::json const& params)
++{
++	if (!MutationsArmed()) return ErrorResponse(id, -32003, "File changes are not armed");
++	if (params["plan_id"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "plan_id must be a string");
++	auto planId = params["plan_id"].string_value();
++	auto now = GetTickCount64();
++	for (auto it = plans_.begin(); it != plans_.end();) {
++		if (now >= it->second.expiry) it = plans_.erase(it);
++		else ++it;
++	}
++	auto found = plans_.find(planId);
++	if (found == plans_.end()) return ErrorResponse(id, -32006, "Unknown or expired plan");
++	Plan plan = std::move(found->second);
++	auto* state = Session(plan.session);
++	if (!state) {
++		plans_.erase(found);
++		return ErrorResponse(id, -32006, "Plan session is no longer available");
++	}
++	auto const& site = state->GetSite();
++	if (!state->IsRemoteConnected() || !state->IsRemoteIdle()) {
++		return ErrorResponse(id, -32007, "Session not connected or busy");
++	}
++	Roots roots;
++	if (!SiteRoots(site, roots)) return ErrorResponse(id, -32004, "Site has no API roots");
++	CServerPath remote, from, to;
++	std::wstring localFrom, localTo;
++	if (plan.op == "mkdir" || plan.op == "delete") {
++		if (!RelativePath(plan.path, false) || !RemotePathFor(roots.remote, plan.path, false, remote) ||
++			!LocalPathFor(roots.local, plan.path, false, localFrom)) {
++			return ErrorResponse(id, -32004, "Plan path is outside API roots");
++		}
++	}
++	else {
++		if (!RelativePath(plan.from, false) || !RelativePath(plan.to, false) ||
++			!RemotePathFor(roots.remote, plan.from, false, from) || !RemotePathFor(roots.remote, plan.to, false, to) ||
++			!LocalPathFor(roots.local, plan.from, false, localFrom) || !LocalPathFor(roots.local, plan.to, false, localTo) ||
++			from.GetParent() != to.GetParent()) {
++			return ErrorResponse(id, -32004, "Plan path is outside API roots");
++		}
++	}
++	plans_.erase(found);
++	if (!state->m_pCommandQueue) return ErrorResponse(id, -32007, "Session command queue unavailable");
++	fz::json result;
++	result["executed"] = true;
++	result["op"] = plan.op;
++	if (plan.op == "mkdir") {
++		state->m_pCommandQueue->ProcessCommand(new CMkdirCommand(remote, transfer_flags::none));
++		result["relative"] = plan.path;
++		result["remote"] = remote.GetPath();
++		Audit("fs.commit", site.GetName(), {plan.path, remote.GetPath()}, "executed mkdir");
++	}
++	else if (plan.op == "rename") {
++		CServerPath parent = from.GetParent();
++		state->m_pCommandQueue->ProcessCommand(new CRenameCommand(parent, from.GetLastSegment(), parent, to.GetLastSegment()));
++		result["from_relative"] = plan.from;
++		result["to_relative"] = plan.to;
++		result["from_remote"] = from.GetPath();
++		result["to_remote"] = to.GetPath();
++		Audit("fs.commit", site.GetName(), {plan.from, from.GetPath(), plan.to, to.GetPath()}, "executed rename");
++	}
++	else {
++		CServerPath parent = remote.GetParent();
++		state->m_pCommandQueue->ProcessCommand(new CDeleteCommand(parent, std::vector<std::wstring>{remote.GetLastSegment()}));
++		result["relative"] = plan.path;
++		result["remote"] = remote.GetPath();
++		Audit("fs.commit", site.GetName(), {plan.path, remote.GetPath()}, "executed delete");
++	}
++	return Reply(id, std::move(result));
++}
+ #endif
+diff --git a/src/interface/local_api.h b/src/interface/local_api.h
+index bff8c23..a0ea901 100644
+--- a/src/interface/local_api.h
++++ b/src/interface/local_api.h
+@@ -5,9 +5,12 @@
+ #include "state.h"
+ #include <wx/timer.h>
+ #include <libfilezilla/json.hpp>
++#include <cstdint>
+ #include <map>
+ #include <mutex>
++#include <string>
+ #include <thread>
++#include <vector>
+ #include <windows.h>
+ 
+ class CMainFrame;
+@@ -22,6 +25,9 @@ public:
+ 	void Stop();
+ 	void ForgetSession(CState* state);
+ 	wxString Status();
++	bool MutationsArmed();
++	bool ArmMutations();
++	void DisarmMutations();
+ 
+ private:
+ 	void Tick(wxTimerEvent&);
+@@ -30,15 +36,46 @@ private:
+ 	bool FinishIo(OVERLAPPED& ov, BOOL immediate, ULONGLONG deadline, DWORD& transferred);
+ 	std::string Exchange(std::string const& line);
+ 	fz::json Dispatch(fz::json const& request, ULONGLONG deadline);
++	fz::json Cwd(fz::json const& id, fz::json const& params);
++	fz::json Download(fz::json const& id, fz::json const& params);
++	fz::json Upload(fz::json const& id, fz::json const& params);
++	fz::json JobStatus(fz::json const& id, fz::json const& params);
++	fz::json Prepare(fz::json const& id, fz::json const& params);
++	fz::json Commit(fz::json const& id, fz::json const& params);
+ 	void OnStateChange(CState*, t_statechange_notifications, std::wstring const&, void const*) override;
+ 	std::string Id(CState* state);
++	CState* Session(std::string const& id);
+ 	bool IsSession(CState* state) const;
++	void Audit(std::string const& method, std::wstring const& site, std::vector<std::wstring> const& paths, std::string const& result);
+ 	void Error(DWORD code);
+ 
++	struct Plan {
++		std::string op;
++		std::string session;
++		std::wstring path;
++		std::wstring from;
++		std::wstring to;
++		ULONGLONG expiry{};
++	};
++
++	struct Job {
++		std::string id;
++		std::string kind;
++		std::string created_utc;
++		std::string session;
++		std::wstring local_path;
++		std::wstring remote_path;
++	};
++
+ 	CMainFrame& frame_;
+ 	wxTimer timer_;
+ 	std::map<CState*, std::string> ids_;
+ 	uint64_t next_id_{};
++	std::map<std::string, Plan> plans_;
++	uint64_t next_plan_{};
++	std::vector<Job> jobs_;
++	uint64_t next_job_{};
++	ULONGLONG armed_until_{};
+ 	HANDLE pipe_{INVALID_HANDLE_VALUE};
+ 	HANDLE stop_{};
+ 	HANDLE done_{};
+diff --git a/src/interface/menu_bar.cpp b/src/interface/menu_bar.cpp
+index f5b2b02..ac82083 100644
+--- a/src/interface/menu_bar.cpp
++++ b/src/interface/menu_bar.cpp
+@@ -139,8 +139,10 @@ CMenuBar::CMenuBar(CMainFrame& mainFrame, COptions& options)
+ 	wxMenu* api = new wxMenu;
+ 	server->AppendSubMenu(api, _("&API"));
+ 	api->AppendCheckItem(XRCID("ID_MENU_API_ENABLE"), _("&Enabled"));
++	api->Append(XRCID("ID_MENU_API_ALLOW_CHANGES"), _("Allow file changes (10 min)"), L"", wxITEM_CHECK);
+ 	api->Append(XRCID("ID_MENU_API_STATUS"), _("&Status / error..."));
+ 	Check(XRCID("ID_MENU_API_ENABLE"), options_.get_int(OPTION_LOCAL_API_ENABLED) != 0);
++	api->Enable(XRCID("ID_MENU_API_ALLOW_CHANGES"), options_.get_int(OPTION_LOCAL_API_ENABLED) != 0);
+ #endif
+ 
+ 	wxMenu* bookmarks = new wxMenu;

@@ -526,7 +526,7 @@ index 0000000..571e973
 +		if (GetTickCount64() >= deadline_) {
 +			response_ = Encode(ErrorResponse(request["id"], -32002, "GUI request timed out"));
 +		}
-+		else if (!frame_.IsEnabled() || frame_.IsBeingDeleted()) {
++		else if (!frame_.IsEnabled()) {
 +			response_ = Encode(ErrorResponse(request["id"], -32000, "GUI unavailable (modal or shutdown)"));
 +		}
 +		else {

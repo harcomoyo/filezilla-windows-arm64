@@ -185,7 +185,7 @@ new file mode 100644
 index 0000000..571e973
 --- /dev/null
 +++ b/src/interface/local_api.cpp
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,458 @@
 +#include "filezilla.h"
 +#include "local_api.h"
 +
@@ -525,9 +525,6 @@ index 0000000..571e973
 +	try {
 +		if (GetTickCount64() >= deadline_) {
 +			response_ = Encode(ErrorResponse(request["id"], -32002, "GUI request timed out"));
-+		}
-+		else if (!frame_.IsEnabled()) {
-+			response_ = Encode(ErrorResponse(request["id"], -32000, "GUI unavailable (modal or shutdown)"));
 +		}
 +		else {
 +			response_ = Encode(Dispatch(request, deadline_));

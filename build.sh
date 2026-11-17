@@ -135,6 +135,7 @@ pushd filezilla-${filezilla_version}
 patch -p1 < ../patches/0002-Enable-shellext-build-on-clang-MinGW.patch
 patch -p1 < ../patches/$shellext_patch
 patch -p1 < ../patches/0004-auto-refresh-all-tabs.patch
+patch -p1 < ../patches/0005-local-api.patch
 autoreconf -fi
 pushd src/fzshellext
 autoreconf -fi

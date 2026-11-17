@@ -1,0 +1,675 @@
+diff --git a/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
+index 64122ee..cbee717 100644
+--- a/src/interface/Mainfrm.cpp
++++ b/src/interface/Mainfrm.cpp
+@@ -1,5 +1,6 @@
+ #include "filezilla.h"
+ #include "Mainfrm.h"
++#include "local_api.h"
+ 
+ #include "aboutdialog.h"
+ #include "asyncrequestqueue.h"
+@@ -531,10 +532,19 @@ CMainFrame::CMainFrame(COptions& options)
+ 	startupTimer_.Start(1, true);
+ 
+ 	UpdateAutoRefreshTimer();
++#ifdef __WXMSW__
++	local_api_ = std::make_unique<LocalApi>(*this);
++	if (options_.get_int(OPTION_LOCAL_API_ENABLED)) {
++		local_api_->Start();
++	}
++#endif
+ }
+ 
+ CMainFrame::~CMainFrame()
+ {
++#ifdef __WXMSW__
++	local_api_.reset();
++#endif
+ 	options_.unwatch_all(this);
+ 
+ 	CPowerManagement::Destroy();
+@@ -820,6 +830,22 @@ void CMainFrame::OnMenuHandler(wxCommandEvent &event)
+ 			}
+ 		}
+ 	}
++#ifdef __WXMSW__
++	else if (id == XRCID("ID_MENU_API_ENABLE")) {
++		if (local_api_ && !m_bQuit) {
++			bool const enabled = options_.get_int(OPTION_LOCAL_API_ENABLED) == 0;
++			options_.set(OPTION_LOCAL_API_ENABLED, enabled ? 1 : 0);
++			m_pMenuBar->Check(XRCID("ID_MENU_API_ENABLE"), enabled);
++			if (enabled) local_api_->Start();
++			else local_api_->Stop();
++		}
++	}
++	else if (id == XRCID("ID_MENU_API_STATUS")) {
++		if (local_api_) {
++			wxMessageBoxEx(local_api_->Status(), _("Local API status"), wxOK | wxICON_INFORMATION, this);
++		}
++	}
++#endif
+ 	else if (id == XRCID("ID_MENU_AUTOREFRESH_ENABLE")) {
+ 		bool const enable = options_.get_int(OPTION_AUTOREFRESH_ALL_TABS) == 0;
+ 		options_.set(OPTION_AUTOREFRESH_ALL_TABS, enable ? 1 : 0);
+@@ -1372,6 +1398,9 @@ void CMainFrame::OnClose(wxCloseEvent &event)
+ 		if (m_pToolBar) {
+ 			options_.set(OPTION_TOOLBAR_HIDDEN, m_pToolBar->IsShown() ? 0 : 1);
+ 		}
++#endif
++#ifdef __WXMSW__
++		if (local_api_) local_api_->Stop();
+ #endif
+ 		m_bQuit = true;
+ 	}
+diff --git a/src/interface/Mainfrm.h b/src/interface/Mainfrm.h
+index 06f311e..0d7ca7d 100644
+--- a/src/interface/Mainfrm.h
++++ b/src/interface/Mainfrm.h
+@@ -34,6 +34,9 @@ class CWindowStateManager;
+ class KeyfilePasswordManager;
+ class HostkeyStore;
+ class TimeFormatter;
++#ifdef __WXMSW__
++class LocalApi;
++#endif
+ 
+ class CMainFrame final : public wxNavigationEnabled<wxFrame>, public COptionChangeEventHandler
+ #if FZ_MANUALUPDATECHECK
+@@ -216,6 +219,9 @@ private:
+ #endif
+ 
+ 	wxTimer startupTimer_;
++#ifdef __WXMSW__
++	std::unique_ptr<LocalApi> local_api_;
++#endif
+ };
+ 
+ #endif
+diff --git a/src/interface/Makefile.am b/src/interface/Makefile.am
+index 60937a8..c133679 100644
+--- a/src/interface/Makefile.am
++++ b/src/interface/Makefile.am
+@@ -66,6 +66,7 @@ filezilla_SOURCES = \
+ 		listingcomparison.cpp \
+ 		list_search_panel.cpp \
+ 		local_recursive_operation.cpp \
++		local_api.cpp \
+ 		locale_initializer.cpp \
+ 		LocalListView.cpp \
+ 		LocalTreeView.cpp \
+@@ -182,6 +183,7 @@ noinst_HEADERS = \
+ 		listingcomparison.h \
+ 		list_search_panel.h \
+ 		local_recursive_operation.h \
++		local_api.h \
+ 		locale_initializer.h \
+ 		LocalListView.h \
+ 		LocalTreeView.h \
+@@ -320,7 +322,7 @@ filezilla_CPPFLAGS += $(LIBSQLITE3_CFLAGS)
+ filezilla_LDFLAGS += $(LIBSQLITE3_LIBS)
+ 
+ if FZ_WINDOWS
+-filezilla_LDFLAGS += -lnormaliz -lole32 -luuid -lnetapi32 -lmpr -lpowrprof -lws2_32 -lshlwapi
++filezilla_LDFLAGS += -lnormaliz -lole32 -luuid -lnetapi32 -lmpr -lpowrprof -lws2_32 -lshlwapi -ladvapi32
+ endif
+ 
+ # GTK+ libs, empty if not using wxGTK
+diff --git a/src/interface/Options.cpp b/src/interface/Options.cpp
+index 6a476d9..550f087 100644
+--- a/src/interface/Options.cpp
++++ b/src/interface/Options.cpp
+@@ -119,7 +119,8 @@ static unsigned int register_interface_options()
+ 		{ "Highest shown overlay id", 0, option_flags::normal },
+ 		{ "Resolve local symlinks", DEFAULT_LOCAL_SYMLINK_RESOLVE, option_flags::platform },
+ 		{ "Auto-refresh all tabs", true, option_flags::normal },
+-		{ "Auto-refresh interval", 20, option_flags::numeric_clamp, 1, 3600 }
++		{ "Auto-refresh interval", 20, option_flags::numeric_clamp, 1, 3600 },
++		{ "Local API enabled", false, option_flags::normal }
+ 	});
+ 	return value;
+ }
+diff --git a/src/interface/Options.h b/src/interface/Options.h
+index 4663b0e..c9e335e 100644
+--- a/src/interface/Options.h
++++ b/src/interface/Options.h
+@@ -88,6 +88,7 @@ enum interfaceOptions : unsigned int
+ 	OPTION_RESOLVE_LOCAL_SYMLINKS,
+ 	OPTION_AUTOREFRESH_ALL_TABS,
+ 	OPTION_AUTOREFRESH_INTERVAL,
++	OPTION_LOCAL_API_ENABLED,
+ 
+ 	// Has to be last element
+ 	OPTIONS_NUM
+diff --git a/src/interface/local_api.cpp b/src/interface/local_api.cpp
+new file mode 100644
+index 0000000..4006a72
+--- /dev/null
++++ b/src/interface/local_api.cpp
+@@ -0,0 +1,448 @@
++#include "filezilla.h"
++#include "local_api.h"
++
++#ifdef __WXMSW__
++#include "Mainfrm.h"
++#include "QueueView.h"
++#include "dialogex.h"
++#include "../include/directorylisting.h"
++#include <sddl.h>
++#include <algorithm>
++#include <set>
++
++namespace {
++constexpr size_t max_request = 64 * 1024;
++constexpr size_t max_response = 1024 * 1024;
++constexpr DWORD timeout_ms = 5000;
++
++bool Members(fz::json const& value, std::initializer_list<char const*> allowed)
++{
++	size_t count{};
++	for (auto key : allowed) {
++		if (value[key]) ++count;
++	}
++	return count == value.children();
++}
++
++// fz::json has already validated syntax. Scan only object member names, since
++// its object map otherwise hides duplicate keys (including escaped aliases).
++bool UniqueMembers(std::string const& input)
++{
++	std::vector<std::set<std::string>> objects;
++	for (size_t i{}; i < input.size();) {
++		char c = input[i++];
++		if (c == '{') objects.emplace_back();
++		else if (c == '}') objects.pop_back();
++		else if (c == '"') {
++			size_t start = i - 1;
++			while (i < input.size()) {
++				char next = input[i++];
++				if (next == '\\') ++i;
++				else if (next == '"') break;
++			}
++			auto next = input.find_first_not_of(" \t\r\n", i);
++			if (next != std::string::npos && input[next] == ':') {
++				auto key = fz::json::parse(std::string_view(input).substr(start, i - start)).string_value();
++				if (!objects.back().insert(std::move(key)).second) return false;
++			}
++		}
++	}
++	return true;
++}
++
++fz::json ErrorResponse(fz::json const& id, int code, char const* message)
++{
++	fz::json reply;
++	reply["jsonrpc"] = "2.0";
++	reply["id"] = id ? id : fz::json(fz::json_type::null);
++	reply["error"]["code"] = code;
++	reply["error"]["message"] = message;
++	return reply;
++}
++
++std::string Encode(fz::json const& reply)
++{
++	auto text = reply.to_string();
++	if (text.size() >= max_response) {
++		text = ErrorResponse(reply["id"], -32003, "Response too large; use a smaller page").to_string();
++	}
++	return text + '\n';
++}
++
++bool Integer(fz::json const& value, int64_t& result)
++{
++	if (!value.is_number()) {
++		return false;
++	}
++	auto text = value.string_value();
++	auto first = !text.empty() && text[0] == '-' ? 1u : 0u;
++	if (first == text.size() || text.find_first_not_of("0123456789", first) != std::string::npos) {
++		return false;
++	}
++	auto number = value.number_value_o<int64_t>();
++	if (!number) {
++		return false;
++	}
++	result = *number;
++	return true;
++}
++}
++
++LocalApi::LocalApi(CMainFrame& frame)
++	: frame_(frame), timer_(this)
++{
++	Bind(wxEVT_TIMER, &LocalApi::Tick, this);
++	CContextManager::Get()->RegisterHandler(this, STATECHANGE_REMOVECONTEXT, false);
++}
++
++LocalApi::~LocalApi()
++{
++	Stop();
++}
++
++void LocalApi::OnStateChange(CState* state, t_statechange_notifications notification, std::wstring const&, void const*)
++{
++	if (notification == STATECHANGE_REMOVECONTEXT) {
++		ids_.erase(state);
++	}
++}
++
++std::string LocalApi::Id(CState* state)
++{
++	auto& id = ids_[state];
++	if (id.empty()) {
++		id = "s-" + std::to_string(++next_id_);
++	}
++	return id;
++}
++
++wxString LocalApi::Status()
++{
++	std::lock_guard<std::mutex> lock(mutex_);
++	return status_;
++}
++
++void LocalApi::Error(DWORD code)
++{
++	std::lock_guard<std::mutex> lock(mutex_);
++	status_ = wxString::Format(L"Error: Win32 %lu", static_cast<unsigned long>(code));
++}
++
++void LocalApi::Start()
++{
++	Stop();
++	// An explicit, protected DACL grants only the process user's SID access.
++	HANDLE token{};
++	DWORD bytes{};
++	PSECURITY_DESCRIPTOR descriptor{};
++	LPWSTR sid{};
++	bool secure = false;
++	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
++		GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
++		std::vector<unsigned char> user(bytes);
++		if (bytes && GetTokenInformation(token, TokenUser, user.data(), bytes, &bytes) &&
++			ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &sid)) {
++			std::wstring dacl = L"D:P(A;;GA;;;" + std::wstring(sid) + L")";
++			secure = ConvertStringSecurityDescriptorToSecurityDescriptorW(dacl.c_str(), SDDL_REVISION_1, &descriptor, nullptr) != FALSE;
++		}
++	}
++	DWORD error = GetLastError();
++	if (sid) LocalFree(sid);
++	if (token) CloseHandle(token);
++	if (!secure) {
++		Error(error);
++		return;
++	}
++	SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
++	auto name = L"\\\\.\\pipe\\filezilla-api-" + std::to_wstring(GetCurrentProcessId());
++	pipe_ = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
++		PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
++		1, 16384, 16384, 0, &attributes);
++	error = GetLastError();
++	LocalFree(descriptor);
++	if (pipe_ == INVALID_HANDLE_VALUE) {
++		Error(error);
++		return;
++	}
++	stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++	done_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++	io_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++	if (!stop_ || !done_ || !io_event_) {
++		error = GetLastError();
++		Stop();
++		Error(error);
++		return;
++	}
++	{
++		std::lock_guard<std::mutex> lock(mutex_);
++		status_ = L"Listening: " + wxString(name);
++	}
++	try {
++		worker_ = std::thread(&LocalApi::Run, this);
++	}
++	catch (...) {
++		Stop();
++		Error(ERROR_NOT_ENOUGH_MEMORY);
++		return;
++	}
++	if (!timer_.Start(100)) {
++		Stop();
++		Error(ERROR_NOT_ENOUGH_MEMORY);
++	}
++}
++
++void LocalApi::Stop()
++{
++	timer_.Stop();
++	if (stop_) SetEvent(stop_);
++	if (worker_.joinable()) worker_.join();
++	if (pipe_ != INVALID_HANDLE_VALUE) CloseHandle(pipe_);
++	pipe_ = INVALID_HANDLE_VALUE;
++	for (auto handle : {stop_, done_, io_event_}) {
++		if (handle) CloseHandle(handle);
++	}
++	stop_ = done_ = io_event_ = nullptr;
++	std::lock_guard<std::mutex> lock(mutex_);
++	pending_ = false;
++	request_.clear();
++	response_.clear();
++	status_ = L"Disabled";
++}
++
++bool LocalApi::FinishIo(OVERLAPPED& ov, BOOL immediate, ULONGLONG deadline, DWORD& transferred)
++{
++	if (immediate) return true;
++	if (GetLastError() != ERROR_IO_PENDING) return false;
++	HANDLE events[]{stop_, ov.hEvent};
++	auto now = GetTickCount64();
++	DWORD wait = deadline ? static_cast<DWORD>(deadline > now ? deadline - now : 0) : INFINITE;
++	if (WaitForMultipleObjects(2, events, FALSE, wait) != WAIT_OBJECT_0 + 1) {
++		// Drain completion before the stack OVERLAPPED or its buffer can disappear.
++		CancelIoEx(pipe_, &ov);
++		GetOverlappedResult(pipe_, &ov, &transferred, TRUE);
++		return false;
++	}
++	return GetOverlappedResult(pipe_, &ov, &transferred, FALSE) != FALSE;
++}
++
++bool LocalApi::Io(bool write, char* data, DWORD size, DWORD& transferred, ULONGLONG deadline)
++{
++	OVERLAPPED ov{};
++	ov.hEvent = io_event_;
++	ResetEvent(io_event_);
++	BOOL immediate = write ? WriteFile(pipe_, data, size, &transferred, &ov) : ReadFile(pipe_, data, size, &transferred, &ov);
++	return FinishIo(ov, immediate, deadline, transferred) && transferred != 0;
++}
++
++void LocalApi::Run()
++{
++	try {
++		while (WaitForSingleObject(stop_, 0) == WAIT_TIMEOUT) {
++			OVERLAPPED ov{};
++			ov.hEvent = io_event_;
++			ResetEvent(io_event_);
++			DWORD ignored{};
++			BOOL connected = ConnectNamedPipe(pipe_, &ov);
++			if (!connected && GetLastError() == ERROR_PIPE_CONNECTED) connected = TRUE;
++			if (!FinishIo(ov, connected, 0, ignored)) {
++				if (WaitForSingleObject(stop_, 0) == WAIT_TIMEOUT) Error(GetLastError());
++				break;
++			}
++			std::string input;
++			ULONGLONG read_deadline = GetTickCount64() + timeout_ms;
++			while (WaitForSingleObject(stop_, 0) == WAIT_TIMEOUT) {
++				auto newline = input.find('\n');
++				if ((newline == std::string::npos && input.size() > max_request) || (newline != std::string::npos && newline > max_request)) {
++					break;
++				}
++				if (newline == std::string::npos) {
++					char buffer[4096];
++					DWORD count{};
++					if (!Io(false, buffer, sizeof(buffer), count, read_deadline)) break;
++					input.append(buffer, count);
++					continue;
++				}
++				auto output = Exchange(input.substr(0, newline));
++				input.erase(0, newline + 1);
++				auto write_deadline = GetTickCount64() + timeout_ms;
++				size_t sent{};
++				while (sent < output.size()) {
++					DWORD count{};
++					if (!Io(true, output.data() + sent, static_cast<DWORD>(output.size() - sent), count, write_deadline)) break;
++					sent += count;
++				}
++				if (sent != output.size()) break;
++				read_deadline = GetTickCount64() + timeout_ms;
++			}
++			DisconnectNamedPipe(pipe_);
++		}
++	}
++	catch (...) {
++		Error(ERROR_NOT_ENOUGH_MEMORY);
++	}
++}
++
++std::string LocalApi::Exchange(std::string const& line)
++{
++	if (line.empty() || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, line.data(), static_cast<int>(line.size()), nullptr, 0)) {
++		return Encode(ErrorResponse({}, -32700, "Invalid UTF-8 JSON"));
++	}
++	auto request = fz::json::parse(line);
++	if (!request) return Encode(ErrorResponse({}, -32700, "Parse error"));
++	auto const& id = static_cast<fz::json const&>(request)["id"];
++	bool valid_id = !id || id.is_null() || id.type() == fz::json_type::string || id.is_number();
++	if (!request.is_object() || !UniqueMembers(line) || !Members(request, {"jsonrpc", "id", "method", "params"}) ||
++		request["jsonrpc"].type() != fz::json_type::string || request["jsonrpc"].string_value() != "2.0" ||
++		request["method"].type() != fz::json_type::string || !valid_id) {
++		return Encode(ErrorResponse({}, -32600, "Invalid Request"));
++	}
++	bool notification = !id;
++	ResetEvent(done_);
++	{
++		std::lock_guard<std::mutex> lock(mutex_);
++		request_ = line;
++		response_.clear();
++		deadline_ = GetTickCount64() + timeout_ms;
++		pending_ = true;
++	}
++	HANDLE events[]{stop_, done_};
++	auto result = WaitForMultipleObjects(2, events, FALSE, timeout_ms);
++	std::lock_guard<std::mutex> lock(mutex_);
++	// Tick holds this same lock through dispatch. Expired queued work is removed,
++	// never left in the GUI event queue to execute a refresh after a timeout.
++	pending_ = false;
++	request_.clear();
++	if (notification || result == WAIT_OBJECT_0) return {};
++	if (result != WAIT_OBJECT_0 + 1 && response_.empty()) return Encode(ErrorResponse(id, -32002, "GUI request timed out"));
++	return response_;
++}
++
++void LocalApi::Tick(wxTimerEvent&)
++{
++	std::lock_guard<std::mutex> lock(mutex_);
++	if (!pending_) return;
++	auto request = fz::json::parse(request_);
++	try {
++		if (GetTickCount64() >= deadline_) {
++			response_ = Encode(ErrorResponse(request["id"], -32002, "GUI request timed out"));
++		}
++		else if (!frame_.IsEnabled() || frame_.IsBeingDeleted() || !wxDialogEx::IsActiveTLW(&frame_)) {
++			response_ = Encode(ErrorResponse(request["id"], -32000, "GUI unavailable (modal or shutdown)"));
++		}
++		else {
++			response_ = Encode(Dispatch(request, deadline_));
++		}
++	}
++	catch (...) {
++		response_ = Encode(ErrorResponse(request["id"], -32603, "Internal error"));
++	}
++	pending_ = false;
++	SetEvent(done_);
++}
++
++fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
++{
++	auto const& id = request["id"];
++	auto const& params = request["params"];
++	auto method = request["method"].string_value();
++	if (params && !params.is_object()) return ErrorResponse(id, -32602, "Params must be an object");
++	if ((method == "api.info" || method == "sessions.list" || method == "queue.summary") && params.children()) {
++		return ErrorResponse(id, -32602, "Method takes no params");
++	}
++	if ((method == "sessions.refresh" && !Members(params, {"session"})) ||
++		(method == "sessions.files" && !Members(params, {"session", "offset", "limit"}))) {
++		return ErrorResponse(id, -32602, "Unknown params member");
++	}
++	fz::json result;
++	if (method == "api.info") {
++		result["version"] = "3.71.1";
++		result["protocol"] = "jsonrpc-2.0-ndjson";
++		result["pipe"] = "filezilla-api-" + std::to_string(GetCurrentProcessId());
++		result["max_request_bytes"] = max_request;
++		result["max_response_bytes"] = max_response;
++		result["cache_semantics"] = "Cached snapshots only; stale=true means freshness is not guaranteed. Refresh acceptance is not completion; re-read files later.";
++	}
++	else if (method == "sessions.list") {
++		result["sessions"] = fz::json(fz::json_type::array);
++		size_t index{};
++		for (auto* state : *CContextManager::Get()->GetAllStates()) {
++			auto& entry = result["sessions"][index++];
++			auto const& site = state->GetSite();
++			entry["id"] = Id(state);
++			entry["active"] = state == CContextManager::Get()->GetCurrentContext();
++			entry["connected"] = state->IsRemoteConnected();
++			entry["idle"] = state->IsRemoteIdle();
++			entry["protocol"] = site ? CServer::GetPrefixFromProtocol(site.server.GetProtocol()) : std::wstring();
++			entry["host"] = site ? site.server.GetHost() : std::wstring();
++			entry["port"] = site ? site.server.GetPort() : 0u;
++			entry["remote_path"] = state->GetRemotePath().GetPath();
++			entry["local_path"] = state->GetLocalDir().GetPath();
++		}
++	}
++	else if (method == "queue.summary") {
++		auto* queue = frame_.GetQueue();
++		if (!queue) return ErrorResponse(id, -32000, "Queue unavailable");
++		result["active"] = queue->IsActive() != 0;
++		result["file_count"] = queue->GetFileCount();
++	}
++	else if (method == "sessions.files" || method == "sessions.refresh") {
++		if (params["session"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
++		CState* selected{};
++		for (auto* state : *CContextManager::Get()->GetAllStates()) {
++			if (Id(state) == params["session"].string_value()) selected = state;
++		}
++		if (!selected) return ErrorResponse(id, -32602, "Unknown session");
++		result["session"] = Id(selected);
++		if (method == "sessions.refresh") {
++			if (!selected->IsRemoteConnected() || !selected->IsRemoteIdle()) return ErrorResponse(id, -32001, "Session not connected or busy (including recursive operations)");
++			// RefreshRemote can show synchronous dialogs when synchronized browsing
++			// needs a local directory. Never enter a nested modal loop from dispatch.
++			if (selected->GetSyncBrowse()) return ErrorResponse(id, -32001, "Disable synchronized browsing before API refresh");
++			if (GetTickCount64() >= deadline) return ErrorResponse(id, -32002, "Refresh expired before execution");
++			if (!selected->RefreshRemote()) return ErrorResponse(id, -32001, "Refresh not accepted");
++			result["accepted"] = true;
++			result["completed"] = false;
++		}
++		else {
++			int64_t offset{}, limit{100};
++			if ((params["offset"] && !Integer(params["offset"], offset)) || (params["limit"] && !Integer(params["limit"], limit)) || offset < 0 || limit < 1 || limit > 1000) {
++				return ErrorResponse(id, -32602, "offset must be nonnegative; limit must be 1..1000 (integers)");
++			}
++			auto listing = selected->GetRemoteDir();
++			result["path"] = listing ? listing->path.GetPath() : selected->GetRemotePath().GetPath();
++			result["cached"] = true;
++			result["stale"] = true;
++			result["available"] = listing != nullptr;
++			result["failed"] = listing && listing->failed();
++			result["unsure"] = listing && listing->get_unsure_flags() != 0;
++			result["offset"] = offset;
++			result["limit"] = limit;
++			size_t total = listing ? listing->size() : 0;
++			result["total"] = total;
++			result["entries"] = fz::json(fz::json_type::array);
++			size_t start = static_cast<uint64_t>(offset) < total ? static_cast<size_t>(offset) : total;
++			size_t end = start + std::min(static_cast<size_t>(limit), total - start);
++			size_t encoded_size{};
++			for (size_t i = start; i < end; ++i) {
++				auto const& file = (*listing)[i];
++				auto& entry = result["entries"][i - start];
++				entry["path"] = listing->path.FormatFilename(file.name);
++				entry["name"] = file.name;
++				entry["size"] = file.size;
++				entry["type"] = file.is_link() ? "link" : file.is_dir() ? "directory" : "file";
++				entry["permissions"] = *file.permissions;
++				encoded_size += entry.to_string().size();
++				if (encoded_size >= max_response) return ErrorResponse(id, -32003, "Response too large; use a smaller page");
++			}
++			result["next_offset"] = end < total ? fz::json() : fz::json(fz::json_type::null);
++			if (end < total) result["next_offset"] = end;
++		}
++	}
++	else return ErrorResponse(id, -32601, "Method not found");
++	fz::json reply;
++	reply["jsonrpc"] = "2.0";
++	reply["id"] = id ? id : fz::json(fz::json_type::null);
++	reply["result"] = std::move(result);
++	return reply;
++}
++#endif
+diff --git a/src/interface/local_api.h b/src/interface/local_api.h
+new file mode 100644
+index 0000000..91c8f35
+--- /dev/null
++++ b/src/interface/local_api.h
+@@ -0,0 +1,53 @@
++#ifndef FILEZILLA_INTERFACE_LOCAL_API_HEADER
++#define FILEZILLA_INTERFACE_LOCAL_API_HEADER
++
++#ifdef __WXMSW__
++#include "state.h"
++#include <wx/timer.h>
++#include <libfilezilla/json.hpp>
++#include <map>
++#include <mutex>
++#include <thread>
++#include <windows.h>
++
++class CMainFrame;
++
++// All state access and lifecycle calls are confined to the wx main thread.
++class LocalApi final : public wxEvtHandler, public CGlobalStateEventHandler
++{
++public:
++	explicit LocalApi(CMainFrame& frame);
++	~LocalApi();
++	void Start();
++	void Stop();
++	wxString Status();
++
++private:
++	void Tick(wxTimerEvent&);
++	void Run();
++	bool Io(bool write, char* data, DWORD size, DWORD& transferred, ULONGLONG deadline);
++	bool FinishIo(OVERLAPPED& ov, BOOL immediate, ULONGLONG deadline, DWORD& transferred);
++	std::string Exchange(std::string const& line);
++	fz::json Dispatch(fz::json const& request, ULONGLONG deadline);
++	void OnStateChange(CState*, t_statechange_notifications, std::wstring const&, void const*) override;
++	std::string Id(CState* state);
++	void Error(DWORD code);
++
++	CMainFrame& frame_;
++	wxTimer timer_;
++	std::map<CState*, std::string> ids_;
++	uint64_t next_id_{};
++	HANDLE pipe_{INVALID_HANDLE_VALUE};
++	HANDLE stop_{};
++	HANDLE done_{};
++	HANDLE io_event_{};
++	std::thread worker_;
++	std::mutex mutex_;
++	wxString status_{L"Disabled"};
++	std::string request_;
++	std::string response_;
++	ULONGLONG deadline_{};
++	bool pending_{};
++};
++#endif
++#endif
+diff --git a/src/interface/menu_bar.cpp b/src/interface/menu_bar.cpp
+index 97f9e10..f5b2b02 100644
+--- a/src/interface/menu_bar.cpp
++++ b/src/interface/menu_bar.cpp
+@@ -135,6 +135,14 @@ CMenuBar::CMenuBar(CMainFrame& mainFrame, COptions& options)
+ 	autorefresh->Append(XRCID("ID_MENU_AUTOREFRESH_ENABLE"), _("&Enabled"), L"", wxITEM_CHECK);
+ 	autorefresh->Append(XRCID("ID_MENU_AUTOREFRESH_INTERVAL"), _("Set &interval..."));
+ 
++#ifdef __WXMSW__
++	wxMenu* api = new wxMenu;
++	server->AppendSubMenu(api, _("&API"));
++	api->AppendCheckItem(XRCID("ID_MENU_API_ENABLE"), _("&Enabled"));
++	api->Append(XRCID("ID_MENU_API_STATUS"), _("&Status / error..."));
++	Check(XRCID("ID_MENU_API_ENABLE"), options_.get_int(OPTION_LOCAL_API_ENABLED) != 0);
++#endif
++
+ 	wxMenu* bookmarks = new wxMenu;
+ 	Append(bookmarks, _("&Bookmarks"));
+ 

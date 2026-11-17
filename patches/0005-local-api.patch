@@ -185,14 +185,13 @@ new file mode 100644
 index 0000000..571e973
 --- /dev/null
 +++ b/src/interface/local_api.cpp
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,461 @@
 +#include "filezilla.h"
 +#include "local_api.h"
 +
 +#ifdef __WXMSW__
 +#include "Mainfrm.h"
 +#include "QueueView.h"
-+#include "dialogex.h"
 +#include "context_control.h"
 +#include "../include/directorylisting.h"
 +#include <sddl.h>
@@ -527,7 +526,7 @@ index 0000000..571e973
 +		if (GetTickCount64() >= deadline_) {
 +			response_ = Encode(ErrorResponse(request["id"], -32002, "GUI request timed out"));
 +		}
-+		else if (!frame_.IsEnabled() || frame_.IsBeingDeleted() || !wxDialogEx::IsActiveTLW(&frame_)) {
++		else if (!frame_.IsEnabled() || frame_.IsBeingDeleted()) {
 +			response_ = Encode(ErrorResponse(request["id"], -32000, "GUI unavailable (modal or shutdown)"));
 +		}
 +		else {

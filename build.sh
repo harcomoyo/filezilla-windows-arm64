@@ -137,6 +137,7 @@ patch -p1 < ../patches/$shellext_patch
 patch -p1 < ../patches/0004-auto-refresh-all-tabs.patch
 patch -p1 < ../patches/0005-local-api.patch
 patch -p1 < ../patches/0006-api-transfers-and-fs.patch
+patch -p1 < ../patches/0007-api-root-refresh-jobs.patch
 autoreconf -fi
 pushd src/fzshellext
 autoreconf -fi

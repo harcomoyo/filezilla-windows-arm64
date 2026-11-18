@@ -79,7 +79,17 @@ internal static class McpServer
                             else
                             {
                                 JsonElement toolArgs = parameters.TryGetProperty("arguments", out var a) ? a : Json.Element(new { });
-                                try { Tools.Validate(tool.Method, toolArgs); }
+                                JsonElement nativeArgs = toolArgs;
+                                int waitSeconds = 0;
+                                try
+                                {
+                                    if (tool.Method == "sessions.refresh")
+                                    {
+                                        waitSeconds = Tools.RefreshWaitSeconds(toolArgs);
+                                        nativeArgs = Json.Element(new { session = toolArgs.GetProperty("session").GetString() });
+                                    }
+                                    else Tools.Validate(tool.Method, toolArgs);
+                                }
                                 catch (BridgeException ex)
                                 {
                                     response = Error(id, -32602, ex.Message);
@@ -88,8 +98,15 @@ internal static class McpServer
                                 }
                                 try
                                 {
-                                    var result = await native.CallAsync(pid, tool.Method, toolArgs);
+                                    var result = waitSeconds > 0
+                                        ? await RefreshFlow.RunAsync(native, pid, nativeArgs, waitSeconds)
+                                        : await native.CallAsync(pid, tool.Method, nativeArgs);
                                     response = Result(id, new { content = new[] { new { type = "text", text = result.GetRawText() } }, isError = false });
+                                }
+                                catch (RefreshTimeoutException ex)
+                                {
+                                    response = Result(id, new { content = new[] { new { type = "text",
+                                        text = $"{ex.Message} Last status: {ex.Status.GetRawText()}" } }, isError = true });
                                 }
                                 catch (BridgeException ex)
                                 {

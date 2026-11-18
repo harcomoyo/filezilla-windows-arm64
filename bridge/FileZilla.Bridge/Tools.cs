@@ -7,8 +7,8 @@ internal static class Tools
     internal static readonly (string Name, string Method, string Description, bool ReadOnly, bool Destructive)[] Definitions =
     [
         ("sessions_list", "sessions.list", "List FileZilla sessions with opaque session IDs.", true, false),
-        ("sessions_files", "sessions.files", "Read a session's cached remote directory listing, with optional pagination.", true, false),
-        ("sessions_refresh", "sessions.refresh", "Request a non-destructive refresh of a session's remote listing.", false, false),
+        ("sessions_files", "sessions.files", "Read a session's cached remote directory listing, with optional pagination. stale reflects whether a refresh has actually been observed for the session.", true, false),
+        ("sessions_refresh", "sessions.refresh", "Request a refresh of a session's remote listing. completed:false means requested, not yet observed. Set wait_seconds above 0 to poll refresh status until completed or timeout.", false, false),
         ("queue_summary", "queue.summary", "Read the transfer queue summary.", true, false),
         ("sessions_cwd", "sessions.cwd", "Change the remote directory using a site-relative POSIX path or an absolute POSIX path under the site root. site must match the session's current site.", false, false),
         ("transfers_download", "transfers.download", "Download a site-relative POSIX path into the site's local mirror root, overwriting an existing local file. site must match the session's current site; optional local_path is relative to that local root and defaults to path.", false, false),
@@ -36,6 +36,8 @@ internal static class Tools
             properties["offset"] = new { type = "integer", minimum = 0, maximum = int.MaxValue };
             properties["limit"] = new { type = "integer", minimum = 1, maximum = 1000 };
         }
+        if (method == "sessions.refresh")
+            properties["wait_seconds"] = new { type = "integer", minimum = 0, maximum = RefreshFlow.MaxWaitSeconds, @default = 0 };
         foreach (string field in new[] { "path", "local_path", "from", "to" })
             if (properties.ContainsKey(field)) properties[field] = new
             {
@@ -64,6 +66,7 @@ internal static class Tools
     {
         "sessions.files" => ["session", "offset", "limit"],
         "sessions.refresh" => ["session"],
+        "sessions.refreshStatus" => ["session", "token"],
         "sessions.cwd" => ["session", "site", "path"],
         "transfers.download" => ["session", "site", "path", "local_path"],
         "transfers.upload" => ["session", "site", "path"],
@@ -77,12 +80,26 @@ internal static class Tools
     private static string[] Required(string method) => method switch
     {
         "sessions.files" or "sessions.refresh" => ["session"],
+        "sessions.refreshStatus" => ["session", "token"],
         "sessions.cwd" => ["session", "site", "path"],
         "transfers.download" or "transfers.upload" => ["session", "site", "path"],
         "fs.prepare" => ["session", "site", "op"],
         "fs.commit" => ["plan_id"],
         _ => []
     };
+
+    internal static int RefreshWaitSeconds(JsonElement args)
+    {
+        if (!Json.HasOnly(args, "session", "wait_seconds"))
+            throw new BridgeException("Arguments must be an object with only session and wait_seconds.");
+        if (!args.TryGetProperty("session", out var session) || session.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(session.GetString()) || session.GetString()!.Any(char.IsControl))
+            throw new BridgeException("session must be a non-empty string without control characters.");
+        if (!args.TryGetProperty("wait_seconds", out var value)) return 0;
+        if (!value.TryGetInt32Safe(out int seconds) || seconds < 0 || seconds > RefreshFlow.MaxWaitSeconds)
+            throw new BridgeException($"wait_seconds must be an integer between 0 and {RefreshFlow.MaxWaitSeconds}.");
+        return seconds;
+    }
 
     internal static void Validate(string method, JsonElement args)
     {

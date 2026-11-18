@@ -1,0 +1,822 @@
+diff --git a/src/interface/QueueView.cpp b/src/interface/QueueView.cpp
+index c28f3f1..e2e92f4 100644
+--- a/src/interface/QueueView.cpp
++++ b/src/interface/QueueView.cpp
+@@ -43,11 +43,21 @@
+ #include <wx/utils.h>
+ 
+ #ifdef __WXMSW__
++#include "api_hooks.h"
+ #include <powrprof.h>
+ #endif
+ 
+ using namespace std::literals;
+ 
++#ifdef __WXMSW__
++namespace {
++std::wstring ApiLocalPath(CFileItem const& item)
++{
++	return item.GetLocalPath().GetPath() + item.GetLocalFile();
++}
++}
++#endif
++
+ class CQueueViewDropTarget final : public CFileDropTarget<wxListCtrlEx>
+ {
+ public:
+@@ -499,6 +509,12 @@ void CQueueView::ProcessNotification(t_EngineData *pEngineData, std::unique_ptr<
+ 					CFileItem* pItem = (CFileItem*)pEngineData->pItem;
+ 					pItem->set_made_progress(true);
+ 				}
++#ifdef __WXMSW__
++				if (pEngineData->pItem->GetType() == QueueItemType::File && status.currentOffset >= 0) {
++					CFileItem* pItem = (CFileItem*)pEngineData->pItem;
++					ApiNotifyTransferProgress(pItem->Download(), ApiLocalPath(*pItem), pItem->GetRemotePath(), pItem->GetRemoteFile(), status.currentOffset);
++				}
++#endif
+ 				pEngineData->pStatusLineCtrl->SetTransferStatus(status);
+ 			}
+ 		}
+@@ -1004,6 +1020,29 @@ void CQueueView::ResetEngine(t_EngineData& data, const ResetReason reason)
+ 			SaveSetItemCount(m_itemCount);
+ 
+ 			CFileItem* const pFileItem = (CFileItem*)data.pItem;
++#ifdef __WXMSW__
++			// Directory-creation items are also CFileItem. Only report a job result
++			// for an actual transfer or the connection that leads into one.
++			if (data.state == t_EngineData::transfer || data.state == t_EngineData::connect) {
++				std::wstring statusText = pFileItem->GetStatusMessage().ToStdWstring();
++				if (reason == ResetReason::success || reason == ResetReason::failure) {
++					if (reason == ResetReason::failure && statusText.empty()) {
++						statusText = L"Transfer failed";
++					}
++					ApiNotifyTransferResult(pFileItem->Download(), ApiLocalPath(*pFileItem), pFileItem->GetRemotePath(), pFileItem->GetRemoteFile(),
++						reason == ResetReason::success, reason == ResetReason::failure ? statusText : std::wstring());
++				}
++				else if ((reason == ResetReason::reset && pFileItem->pending_remove()) || reason == ResetReason::remove) {
++					if (statusText.empty()) {
++						statusText = L"Canceled";
++					}
++					ApiNotifyTransferResult(pFileItem->Download(), ApiLocalPath(*pFileItem), pFileItem->GetRemotePath(), pFileItem->GetRemoteFile(), false, statusText);
++				}
++				else if (reason == ResetReason::retry || reason == ResetReason::reset) {
++					ApiNotifyTransferQueued(pFileItem->Download(), ApiLocalPath(*pFileItem), pFileItem->GetRemotePath(), pFileItem->GetRemoteFile());
++				}
++			}
++#endif
+ 			if (pFileItem->Download()) {
+ 				const std::vector<CState*> *pStates = CContextManager::Get()->GetAllStates();
+ 				for (auto *pState : *pStates) {
+@@ -1263,6 +1302,9 @@ void CQueueView::SendNextCommand(t_EngineData& engineData)
+ 
+ 			fileItem->SetStatusMessage(CFileItem::Status::transferring);
+ 			RefreshItem(engineData.pItem);
++#ifdef __WXMSW__
++			ApiNotifyTransferActive(fileItem->Download(), ApiLocalPath(*fileItem), fileItem->GetRemotePath(), fileItem->GetRemoteFile());
++#endif
+ 
+ 			std::wstring extraFlags;
+ 			std::string persistentState;
+diff --git a/src/interface/api_hooks.h b/src/interface/api_hooks.h
+index 81fa2a2..f17ea4d 100644
+--- a/src/interface/api_hooks.h
++++ b/src/interface/api_hooks.h
+@@ -3,6 +3,7 @@
+ 
+ #ifdef __WXMSW__
+ 
++#include <cstdint>
+ #include <string>
+ 
+ class CServerPath;
+@@ -11,5 +12,12 @@ class CServerPath;
+ // transfer. Matching does not remove the registry entry, so retries are covered.
+ bool ApiConsumeAutoOverwrite(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile);
+ 
++// Queue hooks used to report the real state of API transfers. They only touch a
++// small in-process registry and never wait for the engine or the GUI.
++void ApiNotifyTransferQueued(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile);
++void ApiNotifyTransferActive(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile);
++void ApiNotifyTransferProgress(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile, int64_t transferred);
++void ApiNotifyTransferResult(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile, bool success, std::wstring const& errorText);
++
+ #endif
+ #endif
+diff --git a/src/interface/local_api.cpp b/src/interface/local_api.cpp
+index 748bcd5..6a4803e 100644
+--- a/src/interface/local_api.cpp
++++ b/src/interface/local_api.cpp
+@@ -499,6 +499,17 @@ bool RemotePathFor(CServerPath const& root, std::wstring const& relative, bool a
+ 	return true;
+ }
+ 
++// CServerPath::IsSubdirOf() returns false for a root path even when it is
++// compared with itself, because a root path has no parent. API roots can be "/"
++// on root-mounted sites, so equality must be checked explicitly.
++bool AtOrBelow(CServerPath const& path, CServerPath const& root)
++{
++	if (path.empty() || root.empty() || path.GetType() != root.GetType()) {
++		return false;
++	}
++	return path == root || path.IsSubdirOf(root, false, true);
++}
++
+ bool LocalPathFor(std::wstring const& root, std::wstring const& relative, bool allowEmpty, std::wstring& path)
+ {
+ 	if (!RelativePath(relative, allowEmpty)) {
+@@ -631,26 +642,45 @@ void AppendAuditLine(std::string const& line)
+ }
+ 
+ constexpr ULONGLONG auto_overwrite_ttl_ms = 180 * 1000; // 180 s
+-constexpr size_t max_auto_overwrite_entries = 256;
++constexpr ULONGLONG job_retention_ms = 10 * 60 * 1000; // 10 min
++constexpr size_t max_api_transfer_entries = 256;
++constexpr size_t max_api_jobs = 100;
++constexpr size_t max_refresh_tokens = 32;
++constexpr ULONGLONG refresh_token_ttl_ms = 120 * 1000; // 120 s
+ 
+ // API transfers go through the normal queue, where the file-exists default can
+ // be "ask" and would open a modal dialog. Overwrite is the API default in both
+ // directions: a download replaces an existing local file, an upload replaces an
+ // existing remote file. Remember recent API transfers briefly so ProcessDefaults
+-// can select overwrite without user interaction. The GUI thread owns this
+-// registry. Entries are not consumed, so engine retries of the same transfer
+-// keep working.
+-struct AutoOverwriteEntry
++// can select overwrite without user interaction. The same entries also carry the
++// jobs.status state, keyed by (direction, local path, remote directory, remote
++// file). The GUI thread owns this registry. Entries are not consumed, so engine
++// retries of the same transfer keep working.
++struct ApiTransferEntry
+ {
+ 	bool download{};
+ 	std::wstring localFile;
+ 	std::wstring remotePath;
+ 	std::wstring remoteFile;
+-	ULONGLONG expiry{};
++	ULONGLONG overwrite_expiry{};
+ 	bool audited{};
++
++	std::string job;
++	std::string kind;
++	std::string state;
++	std::string session;
++	std::wstring site;
++	int64_t expected_bytes{-1};
++	int64_t transferred_bytes{};
++	std::string error;
++	std::string created_utc;
++	std::string finished_utc;
++	ULONGLONG job_expiry{};
+ };
+ 
+-std::vector<AutoOverwriteEntry> autoOverwriteEntries;
++std::vector<ApiTransferEntry> apiTransfers;
++std::map<std::string, ULONGLONG> dirtySessions;
++uint64_t next_job_id{};
+ 
+ std::wstring NormalizeLocalForMatch(std::wstring text)
+ {
+@@ -663,26 +693,123 @@ std::wstring NormalizeLocalForMatch(std::wstring text)
+ 	return text;
+ }
+ 
+-void PruneAutoOverwrite(ULONGLONG now)
++bool FinishedJob(ApiTransferEntry const& entry)
+ {
+-	autoOverwriteEntries.erase(std::remove_if(autoOverwriteEntries.begin(), autoOverwriteEntries.end(),
+-		[now](AutoOverwriteEntry const& entry) { return now >= entry.expiry; }), autoOverwriteEntries.end());
++	return entry.state == "done" || entry.state == "failed";
+ }
+ 
+-void RegisterAutoOverwrite(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile)
++size_t JobCount()
++{
++	size_t count{};
++	for (auto const& entry : apiTransfers) {
++		if (!entry.job.empty()) ++count;
++	}
++	return count;
++}
++
++// Finished jobs are kept for ten minutes so a caller can still read their
++// result. Queued or active jobs are only bounded by the overall registry cap.
++void PruneApiTransfers(ULONGLONG now)
++{
++	apiTransfers.erase(std::remove_if(apiTransfers.begin(), apiTransfers.end(),
++		[now](ApiTransferEntry const& entry) {
++			bool const finished = FinishedJob(entry);
++			return (finished && now >= entry.job_expiry && now >= entry.overwrite_expiry) ||
++				(entry.job.empty() && now >= entry.overwrite_expiry);
++		}), apiTransfers.end());
++
++	auto jobs = JobCount();
++	while (jobs > max_api_jobs) {
++		auto victim = apiTransfers.end();
++		for (auto it = apiTransfers.begin(); it != apiTransfers.end(); ++it) {
++			if (!it->job.empty() && FinishedJob(*it)) {
++				victim = it;
++				break;
++			}
++		}
++		if (victim == apiTransfers.end()) {
++			for (auto it = apiTransfers.begin(); it != apiTransfers.end(); ++it) {
++				if (!it->job.empty() && it->state != "active") {
++					victim = it;
++					break;
++				}
++			}
++		}
++		if (victim == apiTransfers.end()) {
++			for (auto it = apiTransfers.begin(); it != apiTransfers.end(); ++it) {
++				if (!it->job.empty()) {
++					victim = it;
++					break;
++				}
++			}
++		}
++		if (victim == apiTransfers.end()) break;
++		apiTransfers.erase(victim);
++		--jobs;
++	}
++
++	while (apiTransfers.size() > max_api_transfer_entries) {
++		auto victim = apiTransfers.begin();
++		for (auto it = apiTransfers.begin(); it != apiTransfers.end(); ++it) {
++			if (FinishedJob(*it)) {
++				victim = it;
++				break;
++			}
++		}
++		apiTransfers.erase(victim);
++	}
++}
++
++ApiTransferEntry* FindTransfer(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile)
++{
++	auto const local = NormalizeLocalForMatch(localFile);
++	auto const remote = remotePath.GetPath();
++	ApiTransferEntry* queued{};
++	ApiTransferEntry* fallback{};
++	for (auto& entry : apiTransfers) {
++		if (entry.download != download || entry.remotePath != remote || entry.remoteFile != remoteFile) {
++			continue;
++		}
++		if (entry.localFile != local) {
++			continue;
++		}
++		if (entry.state == "active") {
++			return &entry;
++		}
++		if (entry.state == "queued" && !queued) {
++			queued = &entry;
++		}
++		fallback = &entry;
++	}
++	return queued ? queued : fallback;
++}
++
++// Registers a queued API transfer and returns its job id. Uploads also mark the
++// session stale: the queue does not refresh the remote listing after an upload,
++// so a caller must request a refresh before the cache can be considered fresh.
++std::string RegisterApiTransfer(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile,
++	std::string kind, int64_t expectedBytes, std::wstring const& site, std::string const& session)
+ {
+ 	auto const now = GetTickCount64();
+-	PruneAutoOverwrite(now);
+-	AutoOverwriteEntry entry;
++	PruneApiTransfers(now);
++	ApiTransferEntry entry;
+ 	entry.download = download;
+ 	entry.localFile = NormalizeLocalForMatch(localFile);
+ 	entry.remotePath = remotePath.GetPath();
+ 	entry.remoteFile = remoteFile;
+-	entry.expiry = now + auto_overwrite_ttl_ms;
+-	autoOverwriteEntries.push_back(std::move(entry));
+-	while (autoOverwriteEntries.size() > max_auto_overwrite_entries) {
+-		autoOverwriteEntries.erase(autoOverwriteEntries.begin());
+-	}
++	entry.overwrite_expiry = now + auto_overwrite_ttl_ms;
++	entry.job = "j-" + std::to_string(++next_job_id);
++	entry.kind = std::move(kind);
++	entry.state = "queued";
++	entry.session = session;
++	entry.site = site;
++	entry.expected_bytes = expectedBytes;
++	entry.created_utc = IsoUtc(std::time(nullptr));
++	auto job = entry.job;
++	apiTransfers.push_back(std::move(entry));
++	if (!download && !session.empty()) dirtySessions[session] = now;
++	PruneApiTransfers(now);
++	return job;
+ }
+ }
+ 
+@@ -691,10 +818,13 @@ void RegisterAutoOverwrite(bool download, std::wstring const& localFile, CServer
+ bool ApiConsumeAutoOverwrite(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile)
+ {
+ 	auto const now = GetTickCount64();
+-	PruneAutoOverwrite(now);
++	PruneApiTransfers(now);
+ 	auto const local = NormalizeLocalForMatch(localFile);
+ 	auto const remote = remotePath.GetPath();
+-	for (auto& entry : autoOverwriteEntries) {
++	for (auto& entry : apiTransfers) {
++		if (now >= entry.overwrite_expiry) {
++			continue;
++		}
+ 		if (entry.download != download || entry.remotePath != remote || entry.remoteFile != remoteFile) {
+ 			continue;
+ 		}
+@@ -716,11 +846,79 @@ bool ApiConsumeAutoOverwrite(bool download, std::wstring const& localFile, CServ
+ 	return false;
+ }
+ 
++// Queue hooks. They are called from the GUI thread and only update the bounded
++// registry above; they never wait for the engine, the queue, or the filesystem.
++void ApiNotifyTransferQueued(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile)
++{
++	auto const now = GetTickCount64();
++	PruneApiTransfers(now);
++	if (auto* entry = FindTransfer(download, localFile, remotePath, remoteFile)) {
++		if (entry->state != "done" && entry->state != "failed") {
++			entry->state = "queued";
++		}
++	}
++}
++
++void ApiNotifyTransferActive(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile)
++{
++	auto const now = GetTickCount64();
++	PruneApiTransfers(now);
++	if (auto* entry = FindTransfer(download, localFile, remotePath, remoteFile)) {
++		if (entry->state != "done" && entry->state != "failed") {
++			entry->state = "active";
++		}
++	}
++}
++
++void ApiNotifyTransferProgress(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile, int64_t transferred)
++{
++	auto const now = GetTickCount64();
++	PruneApiTransfers(now);
++	if (auto* entry = FindTransfer(download, localFile, remotePath, remoteFile)) {
++		if (entry->state != "done" && entry->state != "failed" && transferred >= 0) {
++			entry->transferred_bytes = transferred;
++		}
++	}
++}
++
++void ApiNotifyTransferResult(bool download, std::wstring const& localFile, CServerPath const& remotePath, std::wstring const& remoteFile, bool success, std::wstring const& errorText)
++{
++	auto const now = GetTickCount64();
++	PruneApiTransfers(now);
++	auto* entry = FindTransfer(download, localFile, remotePath, remoteFile);
++	if (!entry || entry->job.empty()) {
++		return;
++	}
++	if (success) {
++		entry->state = "done";
++		if (entry->expected_bytes >= 0) {
++			entry->transferred_bytes = entry->expected_bytes;
++		}
++		entry->error.clear();
++	}
++	else {
++		entry->state = "failed";
++		entry->error = AuditField(errorText);
++		if (entry->transferred_bytes < 0) {
++			entry->transferred_bytes = 0;
++		}
++	}
++	entry->finished_utc = IsoUtc(std::time(nullptr));
++	entry->job_expiry = now + job_retention_ms;
++	if (!download && success && !entry->session.empty()) {
++		// The upload changed the remote side without refreshing the listing.
++		dirtySessions[entry->session] = now;
++	}
++}
++
+ LocalApi::LocalApi(CMainFrame& frame)
+ 	: frame_(frame), timer_(this)
+ {
+ 	Bind(wxEVT_TIMER, &LocalApi::Tick, this);
+ 	CContextManager::Get()->RegisterHandler(this, STATECHANGE_REMOVECONTEXT, false);
++	// Listing notifications prove that a refresh was actually observed. They are
++	// dispatched on the GUI thread through the context manager.
++	CContextManager::Get()->RegisterHandler(this, STATECHANGE_REMOTE_DIR, false);
+ }
+ 
+ LocalApi::~LocalApi()
+@@ -732,12 +930,89 @@ void LocalApi::OnStateChange(CState* state, t_statechange_notifications notifica
+ {
+ 	if (notification == STATECHANGE_REMOVECONTEXT) {
+ 		ForgetSession(state);
++		return;
++	}
++	if (notification != STATECHANGE_REMOTE_DIR || ids_.find(state) == ids_.end()) {
++		return;
++	}
++	// Clearing the cache and failed listings are not observed listing changes.
++	auto listing = state->GetRemoteDir();
++	if (!listing || listing->failed()) {
++		return;
++	}
++	// A listing change is the only evidence that a refresh request has actually
++	// completed. Increment a local generation even when the listing pointer and
++	// entry count are unchanged, so fingerprints always detect a notification.
++	auto const now = GetTickCount64();
++	auto& session = refresh_[state];
++	++session.generation;
++	session.last_change = now;
++	session.fingerprint = Fingerprint(state, session);
++	for (auto& token : session.tokens) {
++		if (!token.completed && token.requested <= now) {
++			token.completed = true;
++			token.completed_at = now;
++		}
++	}
++	PruneRefresh(session, now);
++	auto id = ids_.find(state);
++	if (id != ids_.end()) {
++		auto dirty = dirtySessions.find(id->second);
++		if (dirty != dirtySessions.end() && dirty->second <= now) {
++			dirtySessions.erase(dirty);
++		}
+ 	}
+ }
+ 
+ void LocalApi::ForgetSession(CState* state)
+ {
++	auto id = ids_.find(state);
++	if (id != ids_.end()) {
++		dirtySessions.erase(id->second);
++	}
+ 	ids_.erase(state);
++	refresh_.erase(state);
++}
++
++void LocalApi::PruneRefresh(RefreshSession& session, ULONGLONG now)
++{
++	session.tokens.erase(std::remove_if(session.tokens.begin(), session.tokens.end(),
++		[now](RefreshToken const& token) { return now >= token.expires; }), session.tokens.end());
++}
++
++std::string LocalApi::Fingerprint(CState* state, RefreshSession const& session) const
++{
++	auto listing = state->GetRemoteDir();
++	auto pointer = static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(listing.get()));
++	auto count = static_cast<unsigned long long>(listing ? listing->size() : 0);
++	return std::to_string(session.generation) + ":" + std::to_string(pointer) + ":" + std::to_string(count);
++}
++
++bool LocalApi::Stale(CState* state, RefreshSession const& session, ULONGLONG now) const
++{
++	auto listing = state->GetRemoteDir();
++	if (!listing || listing->failed()) {
++		return true;
++	}
++	for (auto const& token : [REDACTED] {
++		if (!token.completed && now < token.expires) {
++			return true;
++		}
++	}
++	// Without an accepted refresh request there is no proof of freshness. A
++	// listing change from navigation or a previous refresh does not help until a
++	// later refresh has been requested.
++	if (session.last_refresh == 0 || session.last_change < session.last_refresh) {
++		return true;
++	}
++	auto id = ids_.find(state);
++	if (id != ids_.end()) {
++		auto dirty = dirtySessions.find(id->second);
++		if (dirty != dirtySessions.end() && dirty->second > session.last_change) {
++			return true;
++		}
++	}
++	return false;
+ }
+ 
+ bool LocalApi::IsSession(CState* state) const
+@@ -1009,6 +1284,7 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 		return ErrorResponse(id, -32602, "Method takes no params");
+ 	}
+ 	if ((method == "sessions.refresh" && !Members(params, {"session"})) ||
++		(method == "sessions.refreshStatus" && !Members(params, {"session", "token"})) ||
+ 		(method == "sessions.files" && !Members(params, {"session", "offset", "limit"})) ||
+ 		(method == "sessions.cwd" && !Members(params, {"session", "path", "site"})) ||
+ 		(method == "transfers.download" && !Members(params, {"session", "path", "local_path", "site"})) ||
+@@ -1025,7 +1301,7 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 		result["pipe"] = "filezilla-api-" + std::to_string(GetCurrentProcessId());
+ 		result["max_request_bytes"] = max_request;
+ 		result["max_response_bytes"] = max_response;
+-		result["cache_semantics"] = "Cached snapshots only; stale=true means freshness is not guaranteed. Refresh acceptance is not completion; re-read files later.";
++		result["cache_semantics"] = "Cached snapshots only; stale=true means freshness is not guaranteed. Refresh acceptance is not completion; poll sessions.refreshStatus until completed, then re-read files.";
+ 	}
+ 	else if (method == "sessions.list") {
+ 		result["sessions"] = fz::json(fz::json_type::array);
+@@ -1065,8 +1341,28 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 			// needs a local directory. Never enter a nested modal loop from dispatch.
+ 			if (selected->GetSyncBrowse()) return ErrorResponse(id, -32001, "Disable synchronized browsing before API refresh");
+ 			if (GetTickCount64() >= deadline) return ErrorResponse(id, -32002, "Refresh expired before execution");
+-			if (!selected->RefreshRemote()) return ErrorResponse(id, -32001, "Refresh not accepted");
++			auto const now = GetTickCount64();
++			auto& cache = refresh_[selected];
++			PruneRefresh(cache, now);
++			RefreshToken token;
++			token.token = "[REDACTED]" + std::to_string(++next_refresh_);
++			token.requested = now;
++			token.expires = now + refresh_token_ttl_ms;
++			auto const previous_refresh = cache.last_refresh;
++			cache.last_refresh = now;
++			cache.tokens.push_back(token);
++			while (cache.tokens.size() > max_refresh_tokens) {
++				cache.tokens.erase(cache.tokens.begin());
++			}
++			if (!selected->RefreshRemote()) {
++				cache.tokens.pop_back();
++				cache.last_refresh = previous_refresh;
++				return ErrorResponse(id, -32001, "Refresh not accepted");
++			}
+ 			result["accepted"] = true;
++			result["token"] = token.token;
++			// Acceptance is never completion. Callers poll refreshStatus, which only
++			// reports completed once a remote listing change has been observed.
+ 			result["completed"] = false;
+ 		}
+ 		else {
+@@ -1074,10 +1370,14 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 			if ((params["offset"] && !Integer(params["offset"], offset)) || (params["limit"] && !Integer(params["limit"], limit)) || offset < 0 || limit < 1 || limit > 1000) {
+ 				return ErrorResponse(id, -32602, "offset must be nonnegative; limit must be 1..1000 (integers)");
+ 			}
++			auto const now = GetTickCount64();
++			auto& cache = refresh_[selected];
++			PruneRefresh(cache, now);
+ 			auto listing = selected->GetRemoteDir();
+ 			result["path"] = listing ? listing->path.GetPath() : selected->GetRemotePath().GetPath();
+ 			result["cached"] = true;
+-			result["stale"] = true;
++			result["stale"] = Stale(selected, cache, now);
++			result["fingerprint"] = cache.fingerprint.empty() ? Fingerprint(selected, cache) : cache.fingerprint;
+ 			result["available"] = listing != nullptr;
+ 			result["failed"] = listing && listing->failed();
+ 			result["unsure"] = listing && listing->get_unsure_flags() != 0;
+@@ -1104,6 +1404,7 @@ fz::json LocalApi::Dispatch(fz::json const& request, ULONGLONG deadline)
+ 			if (end < total) result["next_offset"] = end;
+ 		}
+ 	}
++	else if (method == "sessions.refreshStatus") return RefreshStatus(id, params);
+ 	else if (method == "sessions.cwd") return Cwd(id, params);
+ 	else if (method == "transfers.download") return Download(id, params);
+ 	else if (method == "transfers.upload") return Upload(id, params);
+@@ -1147,18 +1448,23 @@ fz::json LocalApi::Cwd(fz::json const& id, fz::json const& params)
+ 	}
+ 	if (params["path"].type() != fz::json_type::string) return ErrorResponse(id, -32602, "path must be a string");
+ 	std::wstring requested = FromUtf8(params["path"].string_value());
++	bool const absolute = IsAbsoluteRemote(requested);
+ 	CServerPath target;
+-	if (IsAbsoluteRemote(requested)) {
++	if (absolute) {
+ 		if (!ParseRemotePath(requested, site.server.GetType(), target)) {
+ 			Audit("sessions.cwd", site.GetName(), {requested}, "error -32005");
+ 			return ErrorResponse(id, -32005, "Invalid remote path");
+ 		}
+ 	}
+-	else if (!RemotePathFor(roots.remote, requested, true, target)) {
++	else if (!RemotePathFor(roots.remote, requested, false, target)) {
+ 		Audit("sessions.cwd", site.GetName(), {requested}, "error -32005");
+ 		return ErrorResponse(id, -32005, "Invalid relative path");
+ 	}
+-	if (!target.IsSubdirOf(roots.remote, false, true)) {
++	if (!AtOrBelow(target, roots.remote)) {
++		if (absolute) {
++			Audit("sessions.cwd", site.GetName(), {target.GetPath()}, "error -32005");
++			return ErrorResponse(id, -32005, "Absolute path is outside the site root");
++		}
+ 		Audit("sessions.cwd", site.GetName(), {target.GetPath()}, "error -32004");
+ 		return ErrorResponse(id, -32004, "Path outside API root");
+ 	}
+@@ -1275,24 +1581,15 @@ fz::json LocalApi::Download(fz::json const& id, fz::json const& params)
+ 	}
+ 	auto* queue = frame_.GetQueue();
+ 	if (!queue) return ErrorResponse(id, -32000, "Queue unavailable");
+-	RegisterAutoOverwrite(true, localTarget, remoteParent, remoteName);
++	auto const job = RegisterApiTransfer(true, localTarget, remoteParent, remoteName, "download", entry.size, site.GetName(), Id(state));
+ 	queue->QueueFile(false, true, remoteName, localName, localDir, current, site, entry.size);
+ 	queue->QueueFile_Finish(true);
+-	Job job;
+-	job.id = "j-" + std::to_string(++next_job_);
+-	job.kind = "download";
+-	job.created_utc = IsoUtc(std::time(nullptr));
+-	job.session = Id(state);
+-	job.local_path = localTarget;
+-	job.remote_path = remote.GetPath();
+-	jobs_.push_back(std::move(job));
+-	if (jobs_.size() > 100) jobs_.erase(jobs_.begin());
+-	Audit("transfers.download", site.GetName(), {relative, remote.GetPath(), localTarget}, "accepted " + jobs_.back().id);
++	Audit("transfers.download", site.GetName(), {relative, remote.GetPath(), localTarget}, "accepted " + job);
+ 	fz::json result;
+-	result["job"] = jobs_.back().id;
++	result["job"] = job;
+ 	result["accepted"] = true;
+-	result["local_path"] = jobs_.back().local_path;
+-	result["remote_path"] = jobs_.back().remote_path;
++	result["local_path"] = localTarget;
++	result["remote_path"] = remote.GetPath();
+ 	return Reply(id, std::move(result));
+ }
+ 
+@@ -1367,24 +1664,15 @@ fz::json LocalApi::Upload(fz::json const& id, fz::json const& params)
+ 	}
+ 	auto* queue = frame_.GetQueue();
+ 	if (!queue) return ErrorResponse(id, -32000, "Queue unavailable");
+-	RegisterAutoOverwrite(false, localSource, remoteParent, remoteName);
++	auto const job = RegisterApiTransfer(false, localSource, remoteParent, remoteName, "upload", static_cast<int64_t>(size), site.GetName(), Id(state));
+ 	queue->QueueFile(false, false, localName, remoteName, localDir, remoteParent, site, static_cast<int64_t>(size));
+ 	queue->QueueFile_Finish(true);
+-	Job job;
+-	job.id = "j-" + std::to_string(++next_job_);
+-	job.kind = "upload";
+-	job.created_utc = IsoUtc(std::time(nullptr));
+-	job.session = Id(state);
+-	job.local_path = localSource;
+-	job.remote_path = remote.GetPath();
+-	jobs_.push_back(std::move(job));
+-	if (jobs_.size() > 100) jobs_.erase(jobs_.begin());
+-	Audit("transfers.upload", site.GetName(), {relative, remote.GetPath(), localSource}, "accepted " + jobs_.back().id);
++	Audit("transfers.upload", site.GetName(), {relative, remote.GetPath(), localSource}, "accepted " + job);
+ 	fz::json result;
+-	result["job"] = jobs_.back().id;
++	result["job"] = job;
+ 	result["accepted"] = true;
+-	result["local_path"] = jobs_.back().local_path;
+-	result["remote_path"] = jobs_.back().remote_path;
++	result["local_path"] = localSource;
++	result["remote_path"] = remote.GetPath();
+ 	return Reply(id, std::move(result));
+ }
+ 
+@@ -1392,26 +1680,35 @@ fz::json LocalApi::JobStatus(fz::json const& id, fz::json const& params)
+ {
+ 	auto const& wanted = params["job"];
+ 	if (wanted && wanted.type() != fz::json_type::string) return ErrorResponse(id, -32602, "job must be a string");
++	PruneApiTransfers(GetTickCount64());
+ 	std::string filter;
+ 	bool haveFilter{};
+ 	if (wanted) {
+ 		filter = wanted.string_value();
+ 		haveFilter = true;
+ 		bool found{};
+-		for (auto const& job : jobs_) {
+-			if (job.id == filter) found = true;
++		for (auto const& entry : apiTransfers) {
++			if (!entry.job.empty() && entry.job == filter) found = true;
+ 		}
+ 		if (!found) return ErrorResponse(id, -32008, "Unknown job");
+ 	}
+ 	fz::json result;
+ 	result["jobs"] = fz::json(fz::json_type::array);
+ 	size_t index{};
+-	for (auto const& job : jobs_) {
+-		if (haveFilter && job.id != filter) continue;
+-		auto& entry = result["jobs"][index++];
+-		entry["id"] = job.id;
+-		entry["kind"] = job.kind;
+-		entry["created_utc"] = job.created_utc;
++	for (auto const& entry : apiTransfers) {
++		if (entry.job.empty()) continue;
++		if (haveFilter && entry.job != filter) continue;
++		auto& job = result["jobs"][index++];
++		job["id"] = entry.job;
++		job["kind"] = entry.kind;
++		job["state"] = entry.state;
++		job["expected_bytes"] = entry.expected_bytes;
++		job["transferred_bytes"] = entry.transferred_bytes;
++		if (entry.error.empty()) job["error"] = fz::json(fz::json_type::null);
++		else job["error"] = entry.error;
++		job["created_utc"] = entry.created_utc;
++		if (entry.finished_utc.empty()) job["finished_utc"] = fz::json(fz::json_type::null);
++		else job["finished_utc"] = entry.finished_utc;
+ 	}
+ 	auto* queue = frame_.GetQueue();
+ 	if (!queue) return ErrorResponse(id, -32000, "Queue unavailable");
+@@ -1420,6 +1717,38 @@ fz::json LocalApi::JobStatus(fz::json const& id, fz::json const& params)
+ 	return Reply(id, std::move(result));
+ }
+ 
++fz::json LocalApi::RefreshStatus(fz::json const& id, fz::json const& params)
++{
++	auto const& session = params["session"];
++	if (session.type() != fz::json_type::string) return ErrorResponse(id, -32602, "session must be a string");
++	auto const& wanted = params["token"];
++	if (wanted.type() != fz::json_type::string) return ErrorResponse(id, -32602, "token must be a string");
++	auto* state = Session(session.string_value());
++	if (!state) return ErrorResponse(id, -32602, "Unknown session");
++	auto const now = GetTickCount64();
++	auto& cache = refresh_[state];
++	PruneRefresh(cache, now);
++	RefreshToken const* token{};
++	for (auto const& candidate : cache.tokens) {
++		if (candidate.token == wanted.string_value()) {
++			token = &candidate;
++			break;
++		}
++	}
++	if (!token) return ErrorResponse(id, -32008, "Unknown or expired refresh token");
++	auto listing = state->GetRemoteDir();
++	fz::json result;
++	result["token"] = token->token;
++	result["completed"] = token->completed;
++	result["stale"] = Stale(state, cache, now);
++	result["path"] = listing ? listing->path.GetPath() : state->GetRemotePath().GetPath();
++	result["total"] = listing ? listing->size() : 0;
++	result["fingerprint"] = cache.fingerprint.empty() ? Fingerprint(state, cache) : cache.fingerprint;
++	auto const end = token->completed ? token->completed_at : now;
++	result["waited_ms"] = static_cast<int64_t>(end > token->requested ? end - token->requested : 0);
++	return Reply(id, std::move(result));
++}
++
+ fz::json LocalApi::Prepare(fz::json const& id, fz::json const& params)
+ {
+ 	auto const& session = params["session"];
+@@ -1646,6 +1975,8 @@ fz::json LocalApi::Commit(fz::json const& id, fz::json const& params)
+ 	}
+ 	plans_.erase(found);
+ 	if (!state->m_pCommandQueue) return ErrorResponse(id, -32007, "Session command queue unavailable");
++	// mkdir/rename/delete mutate the remote listing without refreshing it.
++	dirtySessions[Id(state)] = GetTickCount64();
+ 	fz::json result;
+ 	result["executed"] = true;
+ 	result["op"] = plan.op;
+diff --git a/src/interface/local_api.h b/src/interface/local_api.h
+index 93dc71e..e37cf6f 100644
+--- a/src/interface/local_api.h
++++ b/src/interface/local_api.h
+@@ -15,6 +15,27 @@
+ 
+ class CMainFrame;
+ 
++// A refresh request stays pending until a remote-listing change is observed on
++// the same context. Tokens are deliberately short-lived: they are a proof of an
++// observed change, not a durable job handle.
++struct RefreshToken
++{
++	std::string token;
++	ULONGLONG requested{};
++	ULONGLONG expires{};
++	bool completed{};
++	ULONGLONG completed_at{};
++};
++
++struct RefreshSession
++{
++	std::vector<RefreshToken> tokens;
++	ULONGLONG last_change{};
++	ULONGLONG last_refresh{};
++	uint64_t generation{};
++	std::string fingerprint;
++};
++
+ // All state access and lifecycle calls are confined to the wx main thread.
+ class LocalApi final : public wxEvtHandler, public CGlobalStateEventHandler
+ {
+@@ -37,9 +58,13 @@ private:
+ 	fz::json Download(fz::json const& id, fz::json const& params);
+ 	fz::json Upload(fz::json const& id, fz::json const& params);
+ 	fz::json JobStatus(fz::json const& id, fz::json const& params);
++	fz::json RefreshStatus(fz::json const& id, fz::json const& params);
+ 	fz::json Prepare(fz::json const& id, fz::json const& params);
+ 	fz::json Commit(fz::json const& id, fz::json const& params);
+ 	void OnStateChange(CState*, t_statechange_notifications, std::wstring const&, void const*) override;
++	void PruneRefresh(RefreshSession& session, ULONGLONG now);
++	bool Stale(CState* state, RefreshSession const& session, ULONGLONG now) const;
++	std::string Fingerprint(CState* state, RefreshSession const& session) const;
+ 	std::string Id(CState* state);
+ 	CState* Session(std::string const& id);
+ 	bool IsSession(CState* state) const;
+@@ -56,23 +81,14 @@ private:
+ 		ULONGLONG expiry{};
+ 	};
+ 
+-	struct Job {
+-		std::string id;
+-		std::string kind;
+-		std::string created_utc;
+-		std::string session;
+-		std::wstring local_path;
+-		std::wstring remote_path;
+-	};
+-
+ 	CMainFrame& frame_;
+ 	wxTimer timer_;
+ 	std::map<CState*, std::string> ids_;
+ 	uint64_t next_id_{};
+ 	std::map<std::string, Plan> plans_;
+ 	uint64_t next_plan_{};
+-	std::vector<Job> jobs_;
+-	uint64_t next_job_{};
++	std::map<CState*, RefreshSession> refresh_;
++	uint64_t next_refresh_{};
+ 	HANDLE pipe_{INVALID_HANDLE_VALUE};
+ 	HANDLE stop_{};
+ 	HANDLE done_{};

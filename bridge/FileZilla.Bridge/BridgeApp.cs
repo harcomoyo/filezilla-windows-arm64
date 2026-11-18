@@ -24,7 +24,7 @@ internal static class BridgeApp
                 return await McpServer.RunAsync(input, output, diagnostics, native, pid);
             if (args.SequenceEqual(new[] { "--help" }))
             {
-                await diagnostics.WriteLineAsync("filezilla-bridge [--pid PID] mcp | sessions list | files list --session ID [--offset N] [--limit N] | refresh --session ID | queue summary | info | cwd --session S --site NAME --path P | download --session S --site NAME --path REL [--local-path REL] | upload --session S --site NAME --path REL | jobs status [--job J] | fs prepare --session S --site NAME --op mkdir|rename|delete [--path REL | --from REL --to REL] | fs commit --plan ID\nREL is a relative POSIX path under the site's root. cwd also accepts an absolute POSIX path under the site root. NAME must match the session's current site; native validates site and root containment.");
+                await diagnostics.WriteLineAsync("filezilla-bridge [--pid PID] mcp | sessions list | files list --session ID [--offset N] [--limit N] | refresh --session ID [--wait [SECONDS]] | refresh-status --session ID --token T | queue summary | info | cwd --session S --site NAME --path P | download --session S --site NAME --path REL [--local-path REL] | upload --session S --site NAME --path REL | jobs status [--job J] | fs prepare --session S --site NAME --op mkdir|rename|delete [--path REL | --from REL --to REL] | fs commit --plan ID\nREL is a relative POSIX path under the site's root. cwd also accepts an absolute POSIX path under the site root. NAME must match the session's current site; native validates site and root containment. --wait polls refresh status every 250 ms, defaults to 10 seconds, and is capped at 30.");
                 return 0;
             }
             string method;
@@ -33,6 +33,7 @@ internal static class BridgeApp
             else if (args.Count >= 2 && args[0] == "files" && args[1] == "list") { method = "sessions.files"; skip = 2; }
             else if (args.Count >= 2 && args[0] == "queue" && args[1] == "summary") { method = "queue.summary"; skip = 2; }
             else if (args[0] == "refresh") { method = "sessions.refresh"; skip = 1; }
+            else if (args[0] == "refresh-status") { method = "sessions.refreshStatus"; skip = 1; }
             else if (args[0] == "info") { method = "api.info"; skip = 1; }
             else if (args[0] == "cwd") { method = "sessions.cwd"; skip = 1; }
             else if (args[0] == "download") { method = "transfers.download"; skip = 1; }
@@ -41,12 +42,30 @@ internal static class BridgeApp
             else if (args.Count >= 2 && args[0] == "fs" && args[1] == "prepare") { method = "fs.prepare"; skip = 2; }
             else if (args.Count >= 2 && args[0] == "fs" && args[1] == "commit") { method = "fs.commit"; skip = 2; }
             else throw new BridgeException("Unknown command. Use --help for usage.");
+            int? waitSeconds = null;
+            if (method == "sessions.refresh")
+            {
+                int waitIndex = args.FindIndex(i => i == "--wait");
+                if (waitIndex >= 0)
+                {
+                    waitSeconds = RefreshFlow.DefaultWaitSeconds;
+                    if (waitIndex + 1 < args.Count &&
+                        int.TryParse(args[waitIndex + 1], NumberStyles.None, CultureInfo.InvariantCulture, out int requested))
+                    {
+                        waitSeconds = requested;
+                        args.RemoveRange(waitIndex, 2);
+                    }
+                    else args.RemoveAt(waitIndex);
+                    if (waitSeconds < 0 || waitSeconds > RefreshFlow.MaxWaitSeconds)
+                        throw new BridgeException($"--wait must be between 0 and {RefreshFlow.MaxWaitSeconds} seconds.");
+                }
+            }
             var values = new Dictionary<string, object>();
             for (int i = skip; i < args.Count; i += 2)
             {
                 string option = args[i];
                 if (i + 1 >= args.Count || option is not ("--session" or "--site" or "--offset" or "--limit" or "--path" or "--local-path" or
-                    "--job" or "--op" or "--from" or "--to" or "--plan"))
+                    "--job" or "--op" or "--from" or "--to" or "--plan" or "--token"))
                     throw new BridgeException("Unknown, repeated, or incomplete option.");
                 string key = option == "--plan" ? "plan_id" : option[2..].Replace('-', '_');
                 if (values.ContainsKey(key)) throw new BridgeException("Unknown, repeated, or incomplete option.");
@@ -60,7 +79,17 @@ internal static class BridgeApp
             }
             JsonElement parameters = Json.Element(values);
             Tools.Validate(method, parameters);
-            JsonElement result = await native.CallAsync(pid, method, parameters);
+            JsonElement result;
+            if (method == "sessions.refresh" && waitSeconds is > 0)
+            {
+                try { result = await RefreshFlow.RunAsync(native, pid, parameters, waitSeconds.Value); }
+                catch (RefreshTimeoutException ex)
+                {
+                    await Json.WriteAsync(output, ex.Status, Json.MaxResponse);
+                    throw;
+                }
+            }
+            else result = await native.CallAsync(pid, method, parameters);
             await Json.WriteAsync(output, result, Json.MaxResponse);
             return 0;
         }

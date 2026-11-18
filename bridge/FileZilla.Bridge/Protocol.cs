@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace FileZilla.Bridge;
 
-internal sealed class BridgeException(string message) : Exception(message);
+internal class BridgeException(string message) : Exception(message);
 internal sealed class FrameException(string message) : Exception(message);
 
 internal static class Json

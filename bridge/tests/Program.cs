@@ -708,6 +708,202 @@ internal static class Tests
                 await mock.Completion;
             }
         });
+        await Test("Refresh token flow and refresh-status CLI forward exact params", async () =>
+        {
+            await using (var mock = new MockPipe(request =>
+            {
+                Equal("sessions.refresh", request.GetProperty("method").GetString());
+                Equal("{\"session\":\"s\"}", request.GetProperty("params").GetRawText());
+                return Success(new { accepted = true, token = "token-1", completed = false });
+            }))
+            {
+                var result = await Run(["refresh", "--session", "s", "--pid", Pid.ToString()], mock.Client());
+                Equal(0, result.Code);
+                Equal("", result.Error);
+                using var accepted = JsonDocument.Parse(result.Output);
+                Check(accepted.RootElement.GetProperty("accepted").GetBoolean(), "accepted");
+                Equal("token-1", accepted.RootElement.GetProperty("token").GetString());
+                Check(!accepted.RootElement.GetProperty("completed").GetBoolean(), "not yet observed");
+                await mock.Completion;
+            }
+            await using (var mock = new MockPipe(request =>
+            {
+                Equal("sessions.refreshStatus", request.GetProperty("method").GetString());
+                Equal("{\"session\":\"s\",\"token\":\"token-1\"}", request.GetProperty("params").GetRawText());
+                return Success(new { token = "token-1", completed = true, stale = false, path = "/pub", total = 2, fingerprint = "fp", waited_ms = 250 });
+            }))
+            {
+                var result = await Run(["refresh-status", "--session", "s", "--token", "token-1", "--pid", Pid.ToString()], mock.Client());
+                Equal(0, result.Code);
+                Equal("", result.Error);
+                using var status = JsonDocument.Parse(result.Output);
+                Check(status.RootElement.GetProperty("completed").GetBoolean(), "completed");
+                Check(!status.RootElement.GetProperty("stale").GetBoolean(), "fresh");
+                Equal(250, status.RootElement.GetProperty("waited_ms").GetInt32());
+                await mock.Completion;
+            }
+        });
+        await Test("Refresh --wait polls until completed", async () =>
+        {
+            int statusCalls = 0;
+            await using var mock = new PollPipe(request =>
+            {
+                if (request.GetProperty("method").GetString() == "sessions.refresh")
+                {
+                    Equal("{\"session\":\"s\"}", request.GetProperty("params").GetRawText());
+                    return Success(new { accepted = true, token = "token-1", completed = false });
+                }
+                Equal("sessions.refreshStatus", request.GetProperty("method").GetString());
+                Equal("{\"session\":\"s\",\"token\":\"token-1\"}", request.GetProperty("params").GetRawText());
+                statusCalls++;
+                return Success(new { token = "token-1", completed = statusCalls > 1, stale = statusCalls <= 1, path = "/pub",
+                    total = 2, fingerprint = "fp", waited_ms = statusCalls * 250 });
+            });
+            var result = await Run(["refresh", "--session", "s", "--wait", "5", "--pid", Pid.ToString()], mock.Client());
+            Equal(0, result.Code);
+            Equal("", result.Error);
+            Equal(2, statusCalls);
+            using var status = JsonDocument.Parse(result.Output);
+            Check(status.RootElement.GetProperty("completed").GetBoolean(), "final completed");
+            Check(!status.RootElement.GetProperty("stale").GetBoolean(), "final fresh");
+            Equal(2, status.RootElement.GetProperty("total").GetInt32());
+            Check(!result.Output.Contains("wait_seconds"), "wait_seconds never forwarded");
+        });
+        await Test("Refresh --wait defaults to ten seconds and accepts immediate completion", async () =>
+        {
+            await using var mock = new PollPipe(request => request.GetProperty("method").GetString() == "sessions.refresh"
+                ? Success(new { accepted = true, token = "token-1", completed = false })
+                : Success(new { token = "token-1", completed = true, stale = false, path = "/", total = 0, fingerprint = "fp", waited_ms = 0 }));
+            var result = await Run(["refresh", "--session", "s", "--wait", "--pid", Pid.ToString()], mock.Client());
+            Equal(0, result.Code);
+            Equal("", result.Error);
+            using var status = JsonDocument.Parse(result.Output);
+            Check(status.RootElement.GetProperty("completed").GetBoolean(), "default wait polls");
+        });
+        await Test("Refresh --wait timeout prints final status and fails clearly", async () =>
+        {
+            await using var mock = new PollPipe(request => request.GetProperty("method").GetString() == "sessions.refresh"
+                ? Success(new { accepted = true, token = "token-1", completed = false })
+                : Success(new { token = "token-1", completed = false, stale = true, path = "/pub", total = 0, fingerprint = "fp", waited_ms = 1000 }));
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var result = await Run(["refresh", "--session", "s", "--wait", "1", "--pid", Pid.ToString()], mock.Client());
+            clock.Stop();
+            Equal(1, result.Code);
+            Check(result.Error.Contains("within 1 seconds"), "clear timeout message");
+            using var status = JsonDocument.Parse(result.Output);
+            Check(!status.RootElement.GetProperty("completed").GetBoolean(), "final status printed");
+            Check(status.RootElement.GetProperty("stale").GetBoolean(), "final stale printed");
+            Check(clock.Elapsed >= TimeSpan.FromMilliseconds(900) && clock.Elapsed < TimeSpan.FromSeconds(10), "bounded wait");
+        });
+        await Test("MCP sessions_refresh wait_seconds returns accepted or final status", async () =>
+        {
+            await using (var mock = new MockPipe(request =>
+            {
+                Equal("sessions.refresh", request.GetProperty("method").GetString());
+                Equal("{\"session\":\"s\"}", request.GetProperty("params").GetRawText());
+                return Success(new { accepted = true, token = "token-1", completed = false });
+            }))
+            {
+                var result = await Run(["mcp", "--pid", Pid.ToString()], mock.Client(), Initialize() + Ready +
+                    Request(2, "tools/call", new { name = "sessions_refresh", arguments = new { session = "s", wait_seconds = 0 } }));
+                var frame = ParseFrames(result.Output)[1];
+                Check(!frame.GetProperty("result").GetProperty("isError").GetBoolean(), "wait 0 success");
+                using var accepted = JsonDocument.Parse(frame.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString()!);
+                Equal("token-1", accepted.RootElement.GetProperty("token").GetString());
+                Check(!accepted.RootElement.GetProperty("completed").GetBoolean(), "wait 0 accepted object");
+                await mock.Completion;
+            }
+            await using (var mock = new PollPipe(request => request.GetProperty("method").GetString() == "sessions.refresh"
+                ? Success(new { accepted = true, token = "token-1", completed = false })
+                : Success(new { token = "token-1", completed = true, stale = false, path = "/pub", total = 3, fingerprint = "fp", waited_ms = 250 })))
+            {
+                var result = await Run(["mcp", "--pid", Pid.ToString()], mock.Client(), Initialize() + Ready +
+                    Request(2, "tools/call", new { name = "sessions_refresh", arguments = new { session = "s", wait_seconds = 3 } }));
+                var frame = ParseFrames(result.Output)[1];
+                Check(!frame.GetProperty("result").GetProperty("isError").GetBoolean(), "wait 3 success");
+                using var status = JsonDocument.Parse(frame.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString()!);
+                Check(status.RootElement.GetProperty("completed").GetBoolean(), "final status returned");
+                Equal(3, status.RootElement.GetProperty("total").GetInt32());
+                Check(!status.RootElement.TryGetProperty("accepted", out _), "not accepted object");
+            }
+        });
+        await Test("MCP refresh schema bounds wait_seconds and stays strict", async () =>
+        {
+            var tools = Json.Element(Tools.List()).EnumerateArray().ToArray();
+            var schema = tools.Single(t => t.GetProperty("name").GetString() == "sessions_refresh").GetProperty("inputSchema");
+            Check(!schema.GetProperty("additionalProperties").GetBoolean(), "strict refresh schema");
+            var wait = schema.GetProperty("properties").GetProperty("wait_seconds");
+            Equal(0, wait.GetProperty("minimum").GetInt32());
+            Equal(30, wait.GetProperty("maximum").GetInt32());
+            Equal(0, wait.GetProperty("default").GetInt32());
+            Equal("session", string.Join(',', schema.GetProperty("required").EnumerateArray().Select(p => p.GetString())));
+            string description = tools.Single(t => t.GetProperty("name").GetString() == "sessions_refresh").GetProperty("description").GetString()!;
+            Check(description.Contains("requested, not yet observed"), "refresh description states semantics");
+            Check(tools.Single(t => t.GetProperty("name").GetString() == "sessions_files").GetProperty("description").GetString()!
+                .Contains("stale reflects whether a refresh has actually been observed"), "files description states stale semantics");
+            object[] invalid =
+            [
+                new { session = "s", wait_seconds = -1 }, new { session = "s", wait_seconds = 31 },
+                new { session = "s", wait_seconds = 1.5 }, new { session = "s", wait_seconds = "3" },
+                new { session = "s", wait_seconds = 1, extra = true }, new { wait_seconds = 1 }
+            ];
+            foreach (object args in invalid)
+            {
+                var result = await Run(["mcp"], NoServer(), Initialize() + Ready + Request(2, "tools/call", new { name = "sessions_refresh", arguments = args }));
+                Equal(-32602, Code(ParseFrames(result.Output)[1]));
+            }
+        });
+        await Test("MCP refresh timeout is a tool error containing the final status", async () =>
+        {
+            await using var mock = new PollPipe(request => request.GetProperty("method").GetString() == "sessions.refresh"
+                ? Success(new { accepted = true, token = "token-1", completed = false })
+                : Success(new { token = "token-1", completed = false, stale = true, path = "/pub", total = 0, fingerprint = "fp", waited_ms = 1000 }));
+            var result = await Run(["mcp", "--pid", Pid.ToString()], mock.Client(), Initialize() + Ready +
+                Request(2, "tools/call", new { name = "sessions_refresh", arguments = new { session = "s", wait_seconds = 1 } }));
+            var frame = ParseFrames(result.Output)[1];
+            Check(frame.GetProperty("result").GetProperty("isError").GetBoolean(), "timeout is tool error");
+            string text = frame.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString()!;
+            Check(text.Contains("within 1 seconds"), "timeout message");
+            Check(text.Contains("\"completed\":false"), "final status included");
+        });
+        await Test("jobs status passes new native fields through unchanged", async () =>
+        {
+            var payload = new
+            {
+                jobs = new[]
+                {
+                    new { id = "j1", kind = "download", created_utc = "2026-01-01T00:00:00Z", state = "done",
+                        expected_bytes = 10L, transferred_bytes = 10L, error = (string?)null, finished_utc = "2026-01-01T00:00:05Z" }
+                },
+                queue = new { active = false, file_count = 0 }
+            };
+            await using var mock = new MockPipe(_ => Success(payload));
+            var result = await Run(["jobs", "status", "--job", "j1", "--pid", Pid.ToString()], mock.Client());
+            Equal(0, result.Code);
+            using var output = JsonDocument.Parse(result.Output);
+            var job = output.RootElement.GetProperty("jobs")[0];
+            Equal("done", job.GetProperty("state").GetString());
+            Equal(10L, job.GetProperty("expected_bytes").GetInt64());
+            Equal(10L, job.GetProperty("transferred_bytes").GetInt64());
+            Equal(JsonValueKind.Null, job.GetProperty("error").ValueKind);
+            Equal("2026-01-01T00:00:05Z", job.GetProperty("finished_utc").GetString());
+            Equal("2026-01-01T00:00:00Z", job.GetProperty("created_utc").GetString());
+            await mock.Completion;
+        });
+        await Test("cwd schema and validation are unchanged", async () =>
+        {
+            var schema = Json.Element(Tools.List()).EnumerateArray().Single(t => t.GetProperty("name").GetString() == "sessions_cwd")
+                .GetProperty("inputSchema");
+            Equal("session,site,path", string.Join(',', schema.GetProperty("properties").EnumerateObject().Select(p => p.Name)));
+            Equal("session,site,path", string.Join(',', schema.GetProperty("required").EnumerateArray().Select(p => p.GetString())));
+            Check(!schema.GetProperty("additionalProperties").GetBoolean(), "strict cwd schema");
+            var path = schema.GetProperty("properties").GetProperty("path");
+            Check(System.Text.RegularExpressions.Regex.IsMatch("/", path.GetProperty("pattern").GetString()!), "absolute root accepted");
+            var rejected = await Run(["cwd", "--session", "s", "--site", "s", "--path", "../x"], NoServer());
+            Equal(1, rejected.Code);
+            Check(!rejected.Error.Contains("No verified"), "cwd traversal rejected before discovery");
+            await Task.CompletedTask;
+        });
         Console.WriteLine($"{passed} passed, {failed} failed");
         return failed == 0 ? 0 : 1;
     }
@@ -757,8 +953,13 @@ internal static class Tests
 
     private static void Equal<T>(T expected, T actual)
     {
-        if (!EqualityComparer<T>.Default.Equals(expected, actual)) throw new Exception($"Expected {expected}, got {actual}");
+        if (!EqualityComparer<T>.Default.Equals(expected, actual))
+            throw new Exception($"Expected {Show(expected)}, got {Show(actual)}");
     }
+
+    private static string Show<T>(T value) => value is string text
+        ? $"\"{text}\" (len {text.Length}, codes {string.Join(",", text.Select(c => (int)c))})"
+        : value?.ToString() ?? "null";
 
     private static async Task Throws<T>(Func<Task> action, string? contains = null) where T : Exception
     {
@@ -769,6 +970,55 @@ internal static class Tests
             return;
         }
         throw new Exception($"Expected {typeof(T).Name}");
+    }
+
+    private sealed class PollPipe : IAsyncDisposable
+    {
+        internal string Name { get; } = "filezilla-bridge-test-" + Guid.NewGuid().ToString("N");
+        internal int Calls { get; private set; }
+        private readonly NamedPipeServerStream server;
+        private readonly CancellationTokenSource timeout = new(TimeSpan.FromSeconds(20));
+        private readonly Task completion;
+
+        internal PollPipe(Func<JsonElement, string> respond)
+        {
+            server = new NamedPipeServerStream(Name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            completion = Serve(respond);
+        }
+
+        private async Task Serve(Func<JsonElement, string> respond)
+        {
+            while (!timeout.IsCancellationRequested)
+            {
+                await server.WaitForConnectionAsync(timeout.Token);
+                string? frame = await new FrameReader(server, Json.MaxRequest).ReadAsync(timeout.Token);
+                if (frame is null)
+                {
+                    server.Disconnect();
+                    continue;
+                }
+                Calls++;
+                using var request = JsonDocument.Parse(frame);
+                byte[] response = Encoding.UTF8.GetBytes(respond(request.RootElement));
+                await server.WriteAsync(response, timeout.Token);
+                await server.FlushAsync(timeout.Token);
+                try { await server.ReadAsync(new byte[1], timeout.Token); }
+                catch (IOException) { }
+                server.Disconnect();
+            }
+        }
+
+        internal NativeClient Client() => new(() => [Pid], _ => Name, NativeClient.VerifyPid);
+
+        public async ValueTask DisposeAsync()
+        {
+            await timeout.CancelAsync();
+            await server.DisposeAsync();
+            try { await completion; }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or IOException) { }
+            timeout.Dispose();
+        }
     }
 
     private sealed class MockPipe : IAsyncDisposable

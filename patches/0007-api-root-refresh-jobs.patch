@@ -476,7 +476,7 @@ index 748bcd5..6a4803e 100644
 +	if (!listing || listing->failed()) {
 +		return true;
 +	}
-+	for (auto const& token : [REDACTED] {
++	for (auto const& token : session.tokens) {
 +		if (!token.completed && now < token.expires) {
 +			return true;
 +		}
@@ -524,7 +524,7 @@ index 748bcd5..6a4803e 100644
 +			auto& cache = refresh_[selected];
 +			PruneRefresh(cache, now);
 +			RefreshToken token;
-+			token.token = "[REDACTED]" + std::to_string(++next_refresh_);
++			token.token = "rt-" + std::to_string(++next_refresh_);
 +			token.requested = now;
 +			token.expires = now + refresh_token_ttl_ms;
 +			auto const previous_refresh = cache.last_refresh;

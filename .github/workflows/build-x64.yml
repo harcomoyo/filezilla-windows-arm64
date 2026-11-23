@@ -1,0 +1,56 @@
+name: Build for Windows x64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-x64:
+    name: Build
+    runs-on: ubuntu-latest
+    env:
+      llvm_path: "${{ github.workspace }}/llvm-mingw"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            gcc git cmake ninja-build pkg-config p7zip-full libtool make colormake gettext automake autoconf autogen autopoint patch meson autoconf-archive
+          sudo sed -i 's#-L\* | -R\* | -l\*#-L\* | -R\* | -l\* | */libclang_rt.*.a#g' /usr/share/aclocal/libtool.m4
+          wget https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-*.tar.xz
+          rm llvm-mingw-*.tar.xz
+          mv llvm-mingw-* llvm-mingw
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '9e593bb18ea69cc5095e012465dcd675a822ed0d'
+
+      - name: Install x64 libraries
+        run: |
+          export PATH=${{ env.llvm_path }}/bin:$PATH
+          cd ${{ env.RUNVCPKG_VCPKG_ROOT }}
+          sed -i 's/OPTIONS/OPTIONS\n--disable-hardware-acceleration/g' ports/libgnutls/portfile.cmake
+          mkdir triplets_overlay
+          cp triplets/community/x64-mingw-dynamic.cmake triplets_overlay/x64-mingw-dynamic-release.cmake
+          echo "set(VCPKG_BUILD_TYPE release)" >> triplets_overlay/x64-mingw-dynamic-release.cmake
+          ./vcpkg install \
+            --overlay-triplets=triplets_overlay \
+            --clean-after-build \
+            --triplet=x64-mingw-dynamic-release \
+            sqlite3 argon2 zlib
+
+      - name: Build FileZilla x64
+        run: |
+          chmod 755 build.sh
+          ./build.sh x64
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: filezilla_x64
+          path: ./FileZilla*.zip

@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-help_msg="Usage: ./build.sh [arm32|arm64]"
+help_msg="Usage: ./build.sh [arm32|arm64|x64]"
 
 [ -z "$vcpkg_dir" ] && vcpkg_dir=$PWD/vcpkg
 [ -z "$llvm_dir" ] && llvm_dir=$PWD/llvm-mingw
@@ -20,6 +20,13 @@ if [ $# == 1 ]; then
         TARGET=aarch64-w64-mingw32
         shellext_patch="0003-Enable-shellext-on-Windows-ARM64.patch"
         export libclang_rt="${llvm_dir}/lib/clang/22/lib/windows/libclang_rt.builtins-aarch64.a"
+    elif [ $1 == "x64" ]; then
+        arch=x64
+        vcpkg_libs_dir=$vcpkg_dir/installed/x64-mingw-dynamic-release
+        TARGET=x86_64-w64-mingw32
+        shellext_patch="0003-Enable-shellext-on-Windows-x64.patch"
+        cross_file=$work_dir/cross-x64.txt
+        export libclang_rt="${llvm_dir}/lib/clang/22/lib/windows/libclang_rt.builtins-x86_64.a"
     else
         echo $help_msg
         exit -1
@@ -119,7 +126,7 @@ pushd fzssh-${fzssh_version}
 mkdir build
 cd build
 meson setup .. \
-    --cross-file $work_dir/cross.txt \
+    --cross-file ${cross_file:-$work_dir/cross.txt} \
     --prefix=$prefix \
     --buildtype=release \
     --default-library=shared
@@ -145,6 +152,8 @@ if [ $arch == "arm64" ]; then
     sed -i '/fzshellext\/32/d' makezip.sh
 elif [ $arch == "arm32" ]; then
     sed -i '/fzshellext\/64/d' makezip.sh
+elif [ $arch == "x64" ]; then
+    sed -i '/fzshellext\/32/d' makezip.sh
 fi
 sed -i '/fzstorj/d' makezip.sh
 bash makezip.sh ${filezilla_path}
